@@ -5,7 +5,7 @@ mod render;
 mod search;
 mod thumbnails;
 
-use canvas::{aspect_thumb_rect, CanvasState, TITLE_H};
+use canvas::CanvasState;
 use render::RenderContext;
 use search::SearchState;
 use thumbnails::{
@@ -143,6 +143,13 @@ fn main() {
     }
 }
 
+fn recompute_layout(state: &mut AppState) {
+    let sizes: Vec<(i32, i32)> = state.filtered_indices.iter()
+        .map(|&i| (state.windows[i].source_w, state.windows[i].source_h))
+        .collect();
+    state.canvas.compute_layout(&sizes);
+}
+
 fn refresh_windows(state: &mut AppState) {
     // Unregister old thumbnails
     for w in &state.windows {
@@ -169,6 +176,7 @@ fn refresh_windows(state: &mut AppState) {
 
     state.windows = windows;
     update_filter(state);
+    recompute_layout(state);
     update_all_thumbnails(state);
 }
 
@@ -198,13 +206,15 @@ fn update_all_thumbnails(state: &AppState) {
         }
     }
 
-    // Update visible thumbnails with aspect-correct rects
+    // Update visible thumbnails -- flow layout gives aspect-correct rects directly
     for (grid_idx, &win_idx) in state.filtered_indices.iter().enumerate() {
-        let cell_rect = state.canvas.grid_rect(grid_idx);
+        if grid_idx >= state.canvas.layout.len() {
+            break;
+        }
         let w = &state.windows[win_idx];
         if let Some(thumb) = w.thumbnail {
-            let thumb_rect = aspect_thumb_rect(cell_rect, w.source_w, w.source_h);
-            update_thumbnail(thumb, thumb_rect);
+            let tr = state.canvas.thumb_rect(grid_idx);
+            update_thumbnail(thumb, tr);
         }
     }
 }
@@ -294,38 +304,34 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
                         // Draw cell borders, titles, selection, hover, badges
                         for (grid_idx, &win_idx) in state.filtered_indices.iter().enumerate() {
-                            let cell_rect = state.canvas.grid_rect(grid_idx);
+                            if grid_idx >= state.canvas.layout.len() {
+                                break;
+                            }
+                            let cr = state.canvas.cell_rect(grid_idx);
                             let winfo = &state.windows[win_idx];
-                            let thumb_rect = aspect_thumb_rect(cell_rect, winfo.source_w, winfo.source_h);
 
                             if state.selected == Some(grid_idx) {
-                                render.draw_selection_border(thumb_rect);
+                                render.draw_selection_border(cr);
                             } else if state.hovered == Some(grid_idx) {
-                                render.draw_hover_border(thumb_rect);
+                                render.draw_hover_border(cr);
                             } else {
-                                render.draw_cell_border(thumb_rect);
+                                render.draw_cell_border(cr);
                             }
 
                             // Number badges for first 9 windows
                             if grid_idx < 9 {
-                                render.draw_number_badge(thumb_rect, grid_idx + 1);
+                                render.draw_number_badge(cr, grid_idx + 1);
                             }
 
-                            // Title below the aspect-correct thumbnail
-                            let title_h = (TITLE_H * state.canvas.zoom) as i32;
-                            let title_rect = RECT {
-                                left: thumb_rect.left,
-                                top: thumb_rect.bottom + 2,
-                                right: thumb_rect.right,
-                                bottom: thumb_rect.bottom + 2 + title_h,
-                            };
+                            // Title below the cell
+                            let tr = state.canvas.title_rect(grid_idx);
                             let full = format!("[{}] {}", winfo.process_name, winfo.title);
                             let display_title = if full.len() > 45 {
                                 format!("{}...", &full[..42])
                             } else {
                                 full
                             };
-                            render.draw_title(&display_title, title_rect);
+                            render.draw_title(&display_title, tr);
                         }
 
                         render.end_draw();
@@ -345,6 +351,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     state.canvas.anim.active = false;
                     let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
                     state.canvas.zoom_at(mx, my, delta);
+                    recompute_layout(state);
                     update_all_thumbnails(state);
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
@@ -464,6 +471,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         if let Some(ref mut state) = *app.borrow_mut() {
                             state.search.push(c);
                             update_filter(state);
+                            recompute_layout(state);
                             update_all_thumbnails(state);
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
@@ -480,6 +488,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if let Some(ref mut state) = *app.borrow_mut() {
                         state.search.pop();
                         update_filter(state);
+                        recompute_layout(state);
                         state.selected = clamp_selection(state.selected, state.filtered_indices.len());
                         update_all_thumbnails(state);
                         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -491,6 +500,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         if state.search.is_active() {
                             state.search.clear();
                             update_filter(state);
+                            recompute_layout(state);
                             state.selected = clamp_selection(state.selected, state.filtered_indices.len());
                             update_all_thumbnails(state);
                             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -549,13 +559,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 APP.with(|app| {
                     if let Some(ref mut state) = *app.borrow_mut() {
                         let count = state.filtered_indices.len();
-                        let cols = state.canvas.cols();
                         if count > 0 {
                             let idx = match state.selected {
-                                Some(s) => {
-                                    let next = s + cols;
-                                    if next < count { next } else { s % cols }
-                                }
+                                Some(s) => state.canvas.nav_down(s),
                                 None => 0,
                             };
                             select_and_navigate(state, Some(idx), ctrl_held());
@@ -567,15 +573,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 APP.with(|app| {
                     if let Some(ref mut state) = *app.borrow_mut() {
                         let count = state.filtered_indices.len();
-                        let cols = state.canvas.cols();
                         if count > 0 {
                             let idx = match state.selected {
-                                Some(s) if s >= cols => s - cols,
-                                Some(s) => {
-                                    let last_row_start = (count / cols) * cols;
-                                    let target = last_row_start + s;
-                                    if target < count { target } else if target >= cols { target - cols } else { s }
-                                }
+                                Some(s) => state.canvas.nav_up(s),
                                 None => 0,
                             };
                             select_and_navigate(state, Some(idx), ctrl_held());
@@ -662,6 +662,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if let Some(ref mut render) = state.render {
                         render.resize(w, h);
                     }
+                    recompute_layout(state);
+                    update_all_thumbnails(state);
                 }
             });
             LRESULT(0)
