@@ -7,12 +7,13 @@ use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindowVisible, GWL_EXSTYLE, GWL_STYLE, WS_EX_TOOLWINDOW, WS_CHILD,
+    EnumWindows, GetClientRect, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindowVisible, GWL_EXSTYLE, GWL_STYLE, WS_EX_TOOLWINDOW, WS_CHILD,
 };
 
 // DWM_TNP flags
 const DWM_TNP_RECTDESTINATION: u32 = 0x1;
+const DWM_TNP_RECTSOURCE: u32 = 0x2;
 const DWM_TNP_VISIBLE: u32 = 0x8;
 const DWM_TNP_SOURCECLIENTAREAONLY: u32 = 0x10;
 const DWM_TNP_OPACITY: u32 = 0x4;
@@ -25,6 +26,8 @@ pub struct WindowInfo {
     pub thumbnail: Option<isize>,
     pub source_w: i32,
     pub source_h: i32,
+    pub client_w: i32,
+    pub client_h: i32,
 }
 
 fn get_process_name(pid: u32) -> String {
@@ -120,6 +123,8 @@ unsafe extern "system" fn enum_callback_v2(
         thumbnail: None,
         source_w: 0,
         source_h: 0,
+        client_w: 0,
+        client_h: 0,
     });
 
     windows::core::BOOL(1)
@@ -143,10 +148,29 @@ pub fn query_source_size(thumb: isize) -> (i32, i32) {
     }
 }
 
-pub fn update_thumbnail(thumb: isize, dest_rect: RECT) {
+pub fn query_client_area_size(hwnd: HWND) -> (i32, i32) {
+    unsafe {
+        let mut rc = RECT::default();
+        let _ = GetClientRect(hwnd, &mut rc);
+        (rc.right - rc.left, rc.bottom - rc.top)
+    }
+}
+
+pub fn update_thumbnail(thumb: isize, dest_rect: RECT, source_w: i32, source_h: i32) {
+    let has_source = source_w > 0 && source_h > 0;
+    let mut flags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
+    if has_source {
+        flags |= DWM_TNP_RECTSOURCE;
+    }
     let props = DWM_THUMBNAIL_PROPERTIES {
-        dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
+        dwFlags: flags,
         rcDestination: dest_rect,
+        rcSource: RECT {
+            left: 0,
+            top: 0,
+            right: source_w,
+            bottom: source_h,
+        },
         fVisible: windows::core::BOOL(1),
         opacity: 255,
         fSourceClientAreaOnly: windows::core::BOOL(1),

@@ -9,8 +9,8 @@ use canvas::CanvasState;
 use render::RenderContext;
 use search::SearchState;
 use thumbnails::{
-    enumerate_windows_v2, query_source_size, register_thumbnail, unregister_thumbnail,
-    update_thumbnail, WindowInfo,
+    enumerate_windows_v2, query_client_area_size, query_source_size, register_thumbnail,
+    unregister_thumbnail, update_thumbnail, WindowInfo,
 };
 
 use std::cell::RefCell;
@@ -23,6 +23,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, RegisterHotKey, MOD_CONTROL, MOD_NOREPEAT, VK_BACK, VK_CONTROL, VK_DOWN,
     VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
 };
+use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::Foundation::RECT;
 
@@ -52,6 +53,9 @@ thread_local! {
 
 fn main() {
     unsafe {
+        // Must be the very first Win32 call -- enables physical pixel coordinates everywhere
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).unwrap();
+
         let hinstance = GetModuleHandleW(None).unwrap();
 
         let class_name: Vec<u16> = "WinCanvasClass\0".encode_utf16().collect();
@@ -145,7 +149,14 @@ fn main() {
 
 fn recompute_layout(state: &mut AppState) {
     let sizes: Vec<(i32, i32)> = state.filtered_indices.iter()
-        .map(|&i| (state.windows[i].source_w, state.windows[i].source_h))
+        .map(|&i| {
+            let w = &state.windows[i];
+            if w.client_w > 0 && w.client_h > 0 {
+                (w.client_w, w.client_h)
+            } else {
+                (w.source_w, w.source_h)
+            }
+        })
         .collect();
     state.canvas.compute_layout(&sizes);
 }
@@ -164,7 +175,7 @@ fn refresh_windows(state: &mut AppState) {
     // Sort by z-order (EnumWindows already returns in z-order, most recent first)
     // No extra work needed -- EnumWindows gives us top-to-bottom z-order
 
-    // Register thumbnails and query source sizes
+    // Register thumbnails and query source/client sizes
     for w in &mut windows {
         w.thumbnail = register_thumbnail(state.hwnd, w.hwnd);
         if let Some(thumb) = w.thumbnail {
@@ -172,6 +183,9 @@ fn refresh_windows(state: &mut AppState) {
             w.source_w = sw;
             w.source_h = sh;
         }
+        let (cw, ch) = query_client_area_size(w.hwnd);
+        w.client_w = cw;
+        w.client_h = ch;
     }
 
     state.windows = windows;
@@ -201,7 +215,7 @@ fn update_all_thumbnails(state: &AppState) {
                     right: -1,
                     bottom: -1,
                 };
-                update_thumbnail(thumb, hide_rect);
+                update_thumbnail(thumb, hide_rect, 0, 0);
             }
         }
     }
@@ -214,7 +228,12 @@ fn update_all_thumbnails(state: &AppState) {
         let w = &state.windows[win_idx];
         if let Some(thumb) = w.thumbnail {
             let tr = state.canvas.thumb_rect(grid_idx);
-            update_thumbnail(thumb, tr);
+            let (cw, ch) = if w.client_w > 0 && w.client_h > 0 {
+                (w.client_w, w.client_h)
+            } else {
+                (w.source_w, w.source_h)
+            };
+            update_thumbnail(thumb, tr, cw, ch);
         }
     }
 }
