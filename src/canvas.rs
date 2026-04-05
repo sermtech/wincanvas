@@ -102,4 +102,31 @@ impl CanvasState {
         self.pan_x += dx as f64;
         self.pan_y += dy as f64;
     }
+
+    pub fn center_on(&mut self, index: usize) {
+        // Calculate where the cell center WOULD be at pan=(0,0), then set pan
+        // so that point lands at screen center
+        let cols = self.cols();
+        let col = index % cols;
+        let row = index / cols;
+        let cw = self.cell_w();
+        let ch = self.cell_h();
+        let pad = CELL_PADDING * self.zoom;
+        let thumb_h = BASE_CELL_H * self.zoom;
+
+        let total_row_w = cols as f64 * (cw + pad) - pad;
+        let start_x = (self.canvas_w - total_row_w) / 2.0;
+
+        // Cell center without pan
+        let cell_cx = start_x + col as f64 * (cw + pad) + cw / 2.0;
+        let cell_cy = SEARCH_BAR_H + row as f64 * (ch + pad) + thumb_h / 2.0;
+
+        // Screen center
+        let screen_cx = self.canvas_w / 2.0;
+        let screen_cy = self.canvas_h / 2.0;
+
+        // Pan so cell center = screen center
+        self.pan_x = screen_cx - cell_cx;
+        self.pan_y = screen_cy - cell_cy;
+    }
 }

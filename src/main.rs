@@ -228,6 +228,14 @@ thread_local! {
     static CONTEXT_MENU_TARGET: RefCell<Option<usize>> = RefCell::new(None);
 }
 
+fn select_and_center(state: &mut AppState, idx: Option<usize>) {
+    state.selected = idx;
+    if let Some(i) = idx {
+        state.canvas.center_on(i);
+        update_all_thumbnails(state);
+    }
+}
+
 fn clamp_selection(sel: Option<usize>, count: usize) -> Option<usize> {
     match sel {
         Some(_) if count == 0 => None,
@@ -466,30 +474,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                     }
                 });
-            } else if vk == VK_TAB.0 {
-                // Tab: cycle forward through windows
+            } else if vk == VK_TAB.0 || vk == VK_RIGHT.0 {
                 APP.with(|app| {
                     if let Some(ref mut state) = *app.borrow_mut() {
                         let count = state.filtered_indices.len();
                         if count > 0 {
-                            state.selected = Some(match state.selected {
-                                Some(s) => (s + 1) % count,
-                                None => 0,
-                            });
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                        }
-                    }
-                });
-            } else if vk == VK_RIGHT.0 {
-                APP.with(|app| {
-                    if let Some(ref mut state) = *app.borrow_mut() {
-                        let count = state.filtered_indices.len();
-                        if count > 0 {
-                            state.selected = Some(match state.selected {
+                            let idx = match state.selected {
                                 Some(s) if s + 1 < count => s + 1,
                                 Some(_) => 0,
                                 None => 0,
-                            });
+                            };
+                            select_and_center(state, Some(idx));
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
@@ -499,11 +494,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if let Some(ref mut state) = *app.borrow_mut() {
                         let count = state.filtered_indices.len();
                         if count > 0 {
-                            state.selected = Some(match state.selected {
+                            let idx = match state.selected {
                                 Some(0) => count - 1,
                                 Some(s) => s - 1,
                                 None => 0,
-                            });
+                            };
+                            select_and_center(state, Some(idx));
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
@@ -514,13 +510,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let count = state.filtered_indices.len();
                         let cols = state.canvas.cols();
                         if count > 0 {
-                            state.selected = Some(match state.selected {
+                            let idx = match state.selected {
                                 Some(s) => {
                                     let next = s + cols;
                                     if next < count { next } else { s % cols }
                                 }
                                 None => 0,
-                            });
+                            };
+                            select_and_center(state, Some(idx));
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
@@ -531,16 +528,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let count = state.filtered_indices.len();
                         let cols = state.canvas.cols();
                         if count > 0 {
-                            state.selected = Some(match state.selected {
+                            let idx = match state.selected {
                                 Some(s) if s >= cols => s - cols,
                                 Some(s) => {
-                                    // Wrap to last row, same column
                                     let last_row_start = (count / cols) * cols;
                                     let target = last_row_start + s;
                                     if target < count { target } else if target >= cols { target - cols } else { s }
                                 }
                                 None => 0,
-                            });
+                            };
+                            select_and_center(state, Some(idx));
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
