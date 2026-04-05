@@ -66,7 +66,8 @@ impl CanvasState {
         }
     }
 
-    /// Compute flow layout: fixed row height, variable width per window aspect ratio.
+    /// Compute flow layout in world coordinates (zoom-independent).
+    /// Positions are stable across zoom changes -- zoom is applied in cell_rect().
     /// source_sizes: (source_w, source_h) for each filtered window.
     pub fn compute_layout(&mut self, source_sizes: &[(i32, i32)]) {
         let count = source_sizes.len();
@@ -75,9 +76,9 @@ impl CanvasState {
             return;
         }
 
-        let row_h = BASE_ROW_H * self.zoom;
-        let pad = CELL_PADDING * self.zoom;
-        let title_h = TITLE_H * self.zoom;
+        let row_h = BASE_ROW_H;
+        let pad = CELL_PADDING;
+        let title_h = TITLE_H;
         let slot_h = row_h + title_h + 2.0; // thumbnail + gap + title
         let max_row_w = self.canvas_w - 2.0 * pad;
 
@@ -124,16 +125,19 @@ impl CanvasState {
         center_row(&mut self.layout, row_start, count, x - pad, max_row_w, pad);
     }
 
-    /// Look up pre-computed cell rect, applying pan offset.
+    /// Look up pre-computed cell rect, applying zoom + pan transform.
+    /// Layout is in world coords; this returns screen coords.
     pub fn cell_rect(&self, index: usize) -> RECT {
         let c = &self.layout[index];
-        let x = c.x + self.pan_x;
-        let y = c.y + self.pan_y;
+        let x = c.x * self.zoom + self.pan_x;
+        let y = c.y * self.zoom + self.pan_y;
+        let w = c.w * self.zoom;
+        let h = c.h * self.zoom;
         RECT {
             left: x.floor() as i32,
             top: y.floor() as i32,
-            right: (x + c.w).ceil() as i32,
-            bottom: (y + c.h).ceil() as i32,
+            right: (x + w).ceil() as i32,
+            bottom: (y + h).ceil() as i32,
         }
     }
 
@@ -189,14 +193,17 @@ impl CanvasState {
             return;
         }
         let c = &self.layout[index];
-        let cell_cx = c.x + c.w / 2.0;
-        let cell_cy = c.y + c.h / 2.0;
+        // World-to-screen: screen = world * zoom + pan
+        // We want world center to land at screen center:
+        //   screen_cx = world_cx * zoom + target_pan_x
+        let world_cx = c.x + c.w / 2.0;
+        let world_cy = c.y + c.h / 2.0;
 
         let screen_cx = self.canvas_w / 2.0;
         let screen_cy = self.canvas_h / 2.0;
 
-        let target_x = screen_cx - cell_cx;
-        let target_y = screen_cy - cell_cy;
+        let target_x = screen_cx - world_cx * self.zoom;
+        let target_y = screen_cy - world_cy * self.zoom;
         self.animate_pan_to(target_x, target_y, freq, now);
     }
 

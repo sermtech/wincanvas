@@ -370,7 +370,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     state.canvas.anim.active = false;
                     let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
                     state.canvas.zoom_at(mx, my, delta);
-                    recompute_layout(state);
+                    // No recompute_layout here -- zoom is a pure visual transform,
+                    // layout positions are stable in world coordinates
                     update_all_thumbnails(state);
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
