@@ -1,6 +1,6 @@
 use windows::Win32::Foundation::RECT;
 
-pub const BASE_CELL_W: f64 = 300.0;
+pub const BASE_CELL_W: f64 = 360.0;
 pub const BASE_CELL_H: f64 = 200.0;
 pub const CELL_PADDING: f64 = 20.0;
 pub const SEARCH_BAR_H: f64 = 50.0;
