@@ -52,7 +52,12 @@ impl RenderContext {
                 height: (rc.bottom - rc.top) as u32,
             };
 
-            let rt_props = D2D1_RENDER_TARGET_PROPERTIES::default();
+            // Force 96 DPI so 1 DIP = 1 physical pixel, matching DWM thumbnail coordinates
+            let rt_props = D2D1_RENDER_TARGET_PROPERTIES {
+                dpiX: 96.0,
+                dpiY: 96.0,
+                ..Default::default()
+            };
             let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
                 hwnd,
                 pixelSize: size,
