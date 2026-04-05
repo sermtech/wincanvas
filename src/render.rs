@@ -2,11 +2,13 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{D2D1_COLOR_F, D2D_RECT_F, D2D_SIZE_U};
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
-    D2D1_DRAW_TEXT_OPTIONS_NONE,
+    D2D1CreateFactory, D2D1_ROUNDED_RECT, ID2D1Factory, ID2D1HwndRenderTarget,
+    ID2D1SolidColorBrush, D2D1_DRAW_TEXT_OPTIONS_NONE,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_PROPERTIES,
 };
+
+const CORNER_RADIUS: f32 = 8.0;
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
@@ -260,8 +262,13 @@ impl RenderContext {
                 right: rect.right as f32 + 1.0,
                 bottom: rect.bottom as f32 + 1.0,
             };
+            let rounded = D2D1_ROUNDED_RECT {
+                rect: d2d_rect,
+                radiusX: CORNER_RADIUS,
+                radiusY: CORNER_RADIUS,
+            };
             self.target
-                .DrawRectangle(&d2d_rect, &self.highlight_brush, 1.0, None);
+                .DrawRoundedRectangle(&rounded, &self.highlight_brush, 1.0, None);
         }
     }
 
@@ -273,8 +280,13 @@ impl RenderContext {
                 right: rect.right as f32 + 2.0,
                 bottom: rect.bottom as f32 + 2.0,
             };
+            let rounded = D2D1_ROUNDED_RECT {
+                rect: d2d_rect,
+                radiusX: CORNER_RADIUS,
+                radiusY: CORNER_RADIUS,
+            };
             self.target
-                .DrawRectangle(&d2d_rect, &self.hover_brush, 2.0, None);
+                .DrawRoundedRectangle(&rounded, &self.hover_brush, 2.0, None);
         }
     }
 
@@ -316,8 +328,13 @@ impl RenderContext {
                 right: rect.right as f32 + 3.0,
                 bottom: rect.bottom as f32 + 3.0,
             };
+            let rounded = D2D1_ROUNDED_RECT {
+                rect: d2d_rect,
+                radiusX: CORNER_RADIUS,
+                radiusY: CORNER_RADIUS,
+            };
             self.target
-                .DrawRectangle(&d2d_rect, &self.selection_brush, 2.5, None);
+                .DrawRoundedRectangle(&rounded, &self.selection_brush, 2.5, None);
         }
     }
 }

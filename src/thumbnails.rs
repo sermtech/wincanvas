@@ -131,9 +131,16 @@ pub fn register_thumbnail(dest: HWND, source: HWND) -> Option<isize> {
 }
 
 pub fn update_thumbnail(thumb: isize, dest_rect: RECT) {
+    let inset = 2;
+    let inset_rect = RECT {
+        left: dest_rect.left + inset,
+        top: dest_rect.top + inset,
+        right: dest_rect.right - inset,
+        bottom: dest_rect.bottom - inset,
+    };
     let props = DWM_THUMBNAIL_PROPERTIES {
         dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
-        rcDestination: dest_rect,
+        rcDestination: inset_rect,
         fVisible: windows::core::BOOL(1),
         opacity: 255,
         fSourceClientAreaOnly: windows::core::BOOL(1),

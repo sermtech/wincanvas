@@ -17,6 +17,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, RegisterHotKey, MOD_CONTROL, MOD_NOREPEAT, VK_BACK, VK_CONTROL, VK_DOWN,
     VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
@@ -26,6 +27,9 @@ use windows::Win32::Foundation::RECT;
 
 const HOTKEY_ID: i32 = 1;
 const TIMER_ID: usize = 1;
+const ANIM_TIMER_ID: usize = 2;
+const ANIM_INTERVAL_MS: u32 = 16;
+
 struct AppState {
     canvas: CanvasState,
     search: SearchState,
@@ -38,6 +42,7 @@ struct AppState {
     did_pan: bool,
     hwnd: HWND,
     visible: bool,
+    qpc_freq: i64,
 }
 
 thread_local! {
@@ -96,6 +101,8 @@ fn main() {
         let _ = SetTimer(Some(hwnd), TIMER_ID, 2000, None);
 
         // Initialize app state
+        let mut qpc_freq: i64 = 0;
+        let _ = QueryPerformanceFrequency(&mut qpc_freq);
         let canvas = CanvasState::new(screen_w as f64, screen_h as f64);
         let search = SearchState::new();
         let render = RenderContext::new(hwnd);
@@ -112,6 +119,7 @@ fn main() {
             did_pan: false,
             hwnd: hwnd,
             visible: true,
+            qpc_freq,
         };
 
         refresh_windows(&mut state);
@@ -231,10 +239,15 @@ thread_local! {
 fn select_and_navigate(state: &mut AppState, idx: Option<usize>, center: bool) {
     state.selected = idx;
     if let Some(i) = idx {
+        let mut now: i64 = 0;
+        unsafe { let _ = QueryPerformanceCounter(&mut now); }
         if center {
-            state.canvas.center_on(i);
+            state.canvas.center_on(i, state.qpc_freq, now);
         } else {
-            state.canvas.scroll_into_view(i);
+            state.canvas.scroll_into_view(i, state.qpc_freq, now);
+        }
+        if state.canvas.anim.active {
+            unsafe { let _ = SetTimer(Some(state.hwnd), ANIM_TIMER_ID, ANIM_INTERVAL_MS, None); }
         }
         update_all_thumbnails(state);
     }
@@ -313,6 +326,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             APP.with(|app| {
                 if let Some(ref mut state) = *app.borrow_mut() {
+                    state.canvas.anim.active = false;
+                    let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
                     state.canvas.zoom_at(mx, my, delta);
                     update_all_thumbnails(state);
                     let _ = InvalidateRect(Some(hwnd), None, false);
@@ -326,6 +341,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             APP.with(|app| {
                 if let Some(ref mut state) = *app.borrow_mut() {
+                    state.canvas.anim.active = false;
+                    let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
                     state.canvas.is_panning = true;
                     state.canvas.last_mouse_x = mx;
                     state.canvas.last_mouse_y = my;
@@ -599,6 +616,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         if state.visible {
                             refresh_windows(state);
                             let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    }
+                });
+            } else if wparam.0 == ANIM_TIMER_ID {
+                APP.with(|app| {
+                    if let Some(ref mut state) = *app.borrow_mut() {
+                        let mut now: i64 = 0;
+                        let _ = QueryPerformanceCounter(&mut now);
+                        let still_going = state.canvas.tick_animation(now);
+                        update_all_thumbnails(state);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        if !still_going {
+                            let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
                         }
                     }
                 });
