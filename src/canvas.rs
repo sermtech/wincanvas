@@ -189,6 +189,22 @@ impl CanvasState {
         None
     }
 
+    /// Find the insertion index for a drag-drop based on mouse position.
+    pub fn drop_index(&self, mx: i32, my: i32, count: usize, _dragging: usize) -> Option<usize> {
+        // Check each cell's row -- if mouse is in that row, find insertion point
+        for i in 0..count.min(self.layout.len()) {
+            let r = self.cell_rect(i);
+            if my >= r.top && my <= r.bottom {
+                let cx = (r.left + r.right) / 2;
+                if mx <= cx {
+                    return Some(i);
+                }
+            }
+        }
+        // Past the last item or below all rows -- append at end
+        if count > 0 { Some(count - 1) } else { None }
+    }
+
     pub fn zoom_at(&mut self, mx: i32, my: i32, delta: i16) {
         let old_zoom = self.zoom;
         let factor = if delta > 0 { 1.1 } else { 1.0 / 1.1 };

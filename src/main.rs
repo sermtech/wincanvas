@@ -32,6 +32,13 @@ const TIMER_ID: usize = 1;
 const ANIM_TIMER_ID: usize = 2;
 const ANIM_INTERVAL_MS: u32 = 16;
 
+struct DragState {
+    grid_idx: usize,
+    start_x: i32,
+    start_y: i32,
+    active: bool,
+}
+
 struct AppState {
     canvas: CanvasState,
     search: SearchState,
@@ -42,6 +49,8 @@ struct AppState {
     hovered: Option<usize>,
     right_click_start: Option<(i32, i32)>,
     did_pan: bool,
+    drag: Option<DragState>,
+    custom_order: Vec<isize>,
     hwnd: HWND,
     visible: bool,
     qpc_freq: i64,
@@ -122,6 +131,8 @@ fn main() {
             hovered: None,
             right_click_start: None,
             did_pan: false,
+            drag: None,
+            custom_order: Vec::new(),
             hwnd: hwnd,
             visible: true,
             qpc_freq,
@@ -201,6 +212,23 @@ fn update_filter(state: &mut AppState) {
             state.filtered_indices.push(i);
         }
     }
+    if !state.custom_order.is_empty() {
+        apply_custom_order(state);
+    }
+}
+
+fn save_custom_order(state: &mut AppState) {
+    state.custom_order = state.filtered_indices.iter()
+        .map(|&i| state.windows[i].hwnd.0 as isize)
+        .collect();
+}
+
+fn apply_custom_order(state: &mut AppState) {
+    let order = &state.custom_order;
+    state.filtered_indices.sort_by_key(|&i| {
+        let hwnd_val = state.windows[i].hwnd.0 as isize;
+        order.iter().position(|&h| h == hwnd_val).unwrap_or(usize::MAX)
+    });
 }
 
 fn update_all_thumbnails(state: &AppState) {
@@ -432,6 +460,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         state.canvas.last_mouse_y = my;
                         update_all_thumbnails(state);
                         let _ = InvalidateRect(Some(hwnd), None, false);
+                    } else if state.drag.is_some() {
+                        let drag = state.drag.as_mut().unwrap();
+                        if !drag.active {
+                            let dx = mx - drag.start_x;
+                            let dy = my - drag.start_y;
+                            if dx.abs() > 5 || dy.abs() > 5 {
+                                drag.active = true;
+                            }
+                        }
+                        if drag.active {
+                            let count = state.filtered_indices.len();
+                            let new_hover = state.canvas.hit_test(mx, my, count);
+                            if new_hover != state.hovered {
+                                state.hovered = new_hover;
+                                let _ = InvalidateRect(Some(hwnd), None, false);
+                            }
+                        }
                     } else {
                         // Hover tracking
                         let count = state.filtered_indices.len();
@@ -471,12 +516,52 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Some(ref mut state) = *app.borrow_mut() {
                     let count = state.filtered_indices.len();
                     if let Some(grid_idx) = state.canvas.hit_test(mx, my, count) {
-                        let win_idx = state.filtered_indices[grid_idx];
-                        let target_hwnd = state.windows[win_idx].hwnd;
-                        // Hide our window and activate the target
-                        let _ = ShowWindow(hwnd, SW_HIDE);
-                        state.visible = false;
-                        let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(target_hwnd);
+                        if ctrl_held() {
+                            // Ctrl+click: start potential drag
+                            state.selected = Some(grid_idx);
+                            state.drag = Some(DragState {
+                                grid_idx,
+                                start_x: mx,
+                                start_y: my,
+                                active: false,
+                            });
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        } else {
+                            // Plain click: activate the target window
+                            let win_idx = state.filtered_indices[grid_idx];
+                            let target_hwnd = state.windows[win_idx].hwnd;
+                            let _ = ShowWindow(hwnd, SW_HIDE);
+                            state.visible = false;
+                            let _ = SetForegroundWindow(target_hwnd);
+                        }
+                    }
+                }
+            });
+            LRESULT(0)
+        }
+
+        WM_LBUTTONUP => {
+            let mx = (lparam.0 & 0xFFFF) as i16 as i32;
+            let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            APP.with(|app| {
+                if let Some(ref mut state) = *app.borrow_mut() {
+                    if let Some(drag) = state.drag.take() {
+                        if drag.active {
+                            let count = state.filtered_indices.len();
+                            if let Some(drop_idx) = state.canvas.drop_index(mx, my, count, drag.grid_idx) {
+                                if drop_idx != drag.grid_idx {
+                                    let removed = state.filtered_indices.remove(drag.grid_idx);
+                                    let insert_at = if drop_idx > drag.grid_idx { drop_idx - 1 } else { drop_idx };
+                                    state.filtered_indices.insert(insert_at, removed);
+                                    state.selected = Some(insert_at);
+                                    save_custom_order(state);
+                                    recompute_layout(state);
+                                    update_all_thumbnails(state);
+                                }
+                            }
+                        }
+                        state.hovered = None;
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
             });
