@@ -5,11 +5,12 @@ mod render;
 mod search;
 mod thumbnails;
 
-use canvas::CanvasState;
+use canvas::{aspect_thumb_rect, CanvasState, TITLE_H};
 use render::RenderContext;
 use search::SearchState;
 use thumbnails::{
-    enumerate_windows_v2, register_thumbnail, unregister_thumbnail, update_thumbnail, WindowInfo,
+    enumerate_windows_v2, query_source_size, register_thumbnail, unregister_thumbnail,
+    update_thumbnail, WindowInfo,
 };
 
 use std::cell::RefCell;
@@ -156,9 +157,14 @@ fn refresh_windows(state: &mut AppState) {
     // Sort by z-order (EnumWindows already returns in z-order, most recent first)
     // No extra work needed -- EnumWindows gives us top-to-bottom z-order
 
-    // Register thumbnails
+    // Register thumbnails and query source sizes
     for w in &mut windows {
         w.thumbnail = register_thumbnail(state.hwnd, w.hwnd);
+        if let Some(thumb) = w.thumbnail {
+            let (sw, sh) = query_source_size(thumb);
+            w.source_w = sw;
+            w.source_h = sh;
+        }
     }
 
     state.windows = windows;
@@ -192,11 +198,13 @@ fn update_all_thumbnails(state: &AppState) {
         }
     }
 
-    // Update visible thumbnails
+    // Update visible thumbnails with aspect-correct rects
     for (grid_idx, &win_idx) in state.filtered_indices.iter().enumerate() {
-        let rect = state.canvas.grid_rect(grid_idx);
-        if let Some(thumb) = state.windows[win_idx].thumbnail {
-            update_thumbnail(thumb, rect);
+        let cell_rect = state.canvas.grid_rect(grid_idx);
+        let w = &state.windows[win_idx];
+        if let Some(thumb) = w.thumbnail {
+            let thumb_rect = aspect_thumb_rect(cell_rect, w.source_w, w.source_h);
+            update_thumbnail(thumb, thumb_rect);
         }
     }
 }
@@ -286,7 +294,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
                         // Draw cell borders, titles, selection, hover, badges
                         for (grid_idx, &win_idx) in state.filtered_indices.iter().enumerate() {
-                            let thumb_rect = state.canvas.grid_rect(grid_idx);
+                            let cell_rect = state.canvas.grid_rect(grid_idx);
+                            let winfo = &state.windows[win_idx];
+                            let thumb_rect = aspect_thumb_rect(cell_rect, winfo.source_w, winfo.source_h);
 
                             if state.selected == Some(grid_idx) {
                                 render.draw_selection_border(thumb_rect);
@@ -301,8 +311,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 render.draw_number_badge(thumb_rect, grid_idx + 1);
                             }
 
-                            let title_rect = state.canvas.title_rect(grid_idx);
-                            let winfo = &state.windows[win_idx];
+                            // Title below the aspect-correct thumbnail
+                            let title_h = (TITLE_H * state.canvas.zoom) as i32;
+                            let title_rect = RECT {
+                                left: thumb_rect.left,
+                                top: thumb_rect.bottom + 2,
+                                right: thumb_rect.right,
+                                bottom: thumb_rect.bottom + 2 + title_h,
+                            };
                             let full = format!("[{}] {}", winfo.process_name, winfo.title);
                             let display_title = if full.len() > 45 {
                                 format!("{}...", &full[..42])

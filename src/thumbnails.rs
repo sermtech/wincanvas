@@ -1,7 +1,7 @@
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{
-    DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
-    DWM_THUMBNAIL_PROPERTIES,
+    DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
+    DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -23,6 +23,8 @@ pub struct WindowInfo {
     pub process_name: String,
     pub pid: u32,
     pub thumbnail: Option<isize>,
+    pub source_w: i32,
+    pub source_h: i32,
 }
 
 fn get_process_name(pid: u32) -> String {
@@ -116,6 +118,8 @@ unsafe extern "system" fn enum_callback_v2(
         process_name,
         pid,
         thumbnail: None,
+        source_w: 0,
+        source_h: 0,
     });
 
     windows::core::BOOL(1)
@@ -130,17 +134,19 @@ pub fn register_thumbnail(dest: HWND, source: HWND) -> Option<isize> {
     }
 }
 
+pub fn query_source_size(thumb: isize) -> (i32, i32) {
+    unsafe {
+        match DwmQueryThumbnailSourceSize(thumb) {
+            Ok(size) if size.cx > 0 && size.cy > 0 => (size.cx, size.cy),
+            _ => (0, 0),
+        }
+    }
+}
+
 pub fn update_thumbnail(thumb: isize, dest_rect: RECT) {
-    let inset = 2;
-    let inset_rect = RECT {
-        left: dest_rect.left + inset,
-        top: dest_rect.top + inset,
-        right: dest_rect.right - inset,
-        bottom: dest_rect.bottom - inset,
-    };
     let props = DWM_THUMBNAIL_PROPERTIES {
         dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
-        rcDestination: inset_rect,
+        rcDestination: dest_rect,
         fVisible: windows::core::BOOL(1),
         opacity: 255,
         fSourceClientAreaOnly: windows::core::BOOL(1),

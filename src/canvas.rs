@@ -5,6 +5,35 @@ pub const BASE_CELL_H: f64 = 200.0;
 pub const CELL_PADDING: f64 = 20.0;
 pub const SEARCH_BAR_H: f64 = 50.0;
 pub const TITLE_H: f64 = 24.0;
+const THUMB_INSET: i32 = 2;
+
+/// Compute aspect-preserving thumbnail rect within a cell.
+/// Fills cell width, adjusts height to match source aspect ratio, top-aligned, inset for border.
+pub fn aspect_thumb_rect(cell_rect: RECT, source_w: i32, source_h: i32) -> RECT {
+    let inset = THUMB_INSET;
+    let cw = (cell_rect.right - cell_rect.left - 2 * inset) as f64;
+    let ch = (cell_rect.bottom - cell_rect.top - 2 * inset) as f64;
+
+    if source_w <= 0 || source_h <= 0 {
+        return RECT {
+            left: cell_rect.left + inset,
+            top: cell_rect.top + inset,
+            right: cell_rect.right - inset,
+            bottom: cell_rect.bottom - inset,
+        };
+    }
+
+    let src_aspect = source_w as f64 / source_h as f64;
+    let th = (cw / src_aspect).min(ch);
+    let tw = (th * src_aspect).min(cw);
+
+    RECT {
+        left: cell_rect.left + inset,
+        top: cell_rect.top + inset,
+        right: cell_rect.left + inset + tw.ceil() as i32,
+        bottom: cell_rect.top + inset + th.ceil() as i32,
+    }
+}
 
 pub struct PanAnimation {
     pub start_x: f64,
