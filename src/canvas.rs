@@ -1,10 +1,11 @@
 use windows::Win32::Foundation::RECT;
 
-pub const BASE_ROW_H: f64 = 200.0;
 pub const CELL_PADDING: f64 = 20.0;
 pub const SEARCH_BAR_H: f64 = 50.0;
 pub const TITLE_H: f64 = 24.0;
 pub const THUMB_INSET: i32 = 2;
+const MIN_ROW_H: f64 = 100.0;
+const MAX_ROW_H: f64 = 500.0;
 
 #[derive(Clone, Debug)]
 pub struct CellLayout {
@@ -67,7 +68,8 @@ impl CanvasState {
     }
 
     /// Compute flow layout in world coordinates (zoom-independent).
-    /// Positions are stable across zoom changes -- zoom is applied in cell_rect().
+    /// Auto-scales row height so all windows fit on screen (Task View style).
+    /// Falls back to MIN_ROW_H with scrolling if too many windows.
     /// source_sizes: (source_w, source_h) for each filtered window.
     pub fn compute_layout(&mut self, source_sizes: &[(i32, i32)]) {
         let count = source_sizes.len();
@@ -76,18 +78,22 @@ impl CanvasState {
             return;
         }
 
-        let row_h = BASE_ROW_H;
         let pad = CELL_PADDING;
         let title_h = TITLE_H;
-        let slot_h = row_h + title_h + 2.0; // thumbnail + gap + title
         let max_row_w = self.canvas_w - 2.0 * pad;
+        let viewport_h = self.canvas_h - SEARCH_BAR_H;
 
-        // Compute each window's width at target row height
+        // Binary search for the largest row_h where all windows fit on screen
+        let row_h = optimal_row_height(source_sizes, max_row_w, viewport_h, pad, title_h);
+
+        let slot_h = row_h + title_h + 2.0;
+
+        // Compute each window's width at the chosen row height
         let widths: Vec<f64> = source_sizes
             .iter()
             .map(|&(sw, sh)| {
                 if sw <= 0 || sh <= 0 {
-                    row_h // fallback: square
+                    row_h
                 } else {
                     let w = row_h * (sw as f64 / sh as f64);
                     w.clamp(row_h * 0.5, row_h * 3.0)
@@ -99,13 +105,12 @@ impl CanvasState {
         self.layout.resize(count, CellLayout { x: 0.0, y: 0.0, w: 0.0, h: 0.0, row: 0 });
 
         let mut x = 0.0;
-        let mut y = SEARCH_BAR_H;
+        let mut y = 0.0;
         let mut row_idx = 0usize;
         let mut row_start = 0usize;
 
         for i in 0..count {
             if x + widths[i] > max_row_w && i > row_start {
-                // Center the completed row
                 center_row(&mut self.layout, row_start, i, x - pad, max_row_w, pad);
                 y += slot_h + pad;
                 x = 0.0;
@@ -121,8 +126,18 @@ impl CanvasState {
             };
             x += widths[i] + pad;
         }
-        // Center last row
         center_row(&mut self.layout, row_start, count, x - pad, max_row_w, pad);
+
+        // Compute content bounds and center vertically in viewport
+        let content_h = y + slot_h; // last row y + one slot height
+        let y_offset = if content_h < viewport_h {
+            SEARCH_BAR_H + (viewport_h - content_h) / 2.0
+        } else {
+            SEARCH_BAR_H + pad
+        };
+        for item in &mut self.layout {
+            item.y += y_offset;
+        }
     }
 
     /// Look up pre-computed cell rect, applying zoom + pan transform.
@@ -379,4 +394,60 @@ fn center_row(layout: &mut [CellLayout], start: usize, end: usize, used_w: f64, 
     for item in &mut layout[start..end] {
         item.x += offset;
     }
+}
+
+/// Find the largest row height where all windows fit in the viewport.
+/// Falls back to MIN_ROW_H if too many windows to fit.
+fn optimal_row_height(
+    source_sizes: &[(i32, i32)],
+    max_row_w: f64,
+    viewport_h: f64,
+    pad: f64,
+    title_h: f64,
+) -> f64 {
+    let max_h = (viewport_h * 0.7).min(MAX_ROW_H).max(MIN_ROW_H);
+    let mut lo = MIN_ROW_H;
+    let mut hi = max_h;
+
+    // 30 iterations of binary search = sub-pixel precision
+    for _ in 0..30 {
+        let mid = (lo + hi) / 2.0;
+        let slot_h = mid + title_h + 2.0 + pad;
+        let rows = count_rows(source_sizes, mid, max_row_w, pad);
+        let total_h = rows as f64 * slot_h - pad;
+
+        if total_h <= viewport_h {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    lo
+}
+
+/// Count how many rows the flow layout would produce at a given row height.
+fn count_rows(source_sizes: &[(i32, i32)], row_h: f64, max_row_w: f64, pad: f64) -> usize {
+    let mut x = 0.0;
+    let mut rows = 1usize;
+    let mut items_in_row = 0usize;
+
+    for &(sw, sh) in source_sizes {
+        let w = if sw > 0 && sh > 0 {
+            (row_h * sw as f64 / sh as f64).clamp(row_h * 0.5, row_h * 3.0)
+        } else {
+            row_h
+        };
+
+        if x + w > max_row_w && items_in_row > 0 {
+            rows += 1;
+            x = 0.0;
+            items_in_row = 0;
+        }
+
+        x += w + pad;
+        items_in_row += 1;
+    }
+
+    rows
 }
