@@ -61,10 +61,10 @@ impl CanvasState {
         let thumb_h = BASE_CELL_H * self.zoom;
 
         RECT {
-            left: x as i32,
-            top: y as i32,
-            right: (x + cw) as i32,
-            bottom: (y + thumb_h) as i32,
+            left: x.floor() as i32,
+            top: y.floor() as i32,
+            right: (x + cw).ceil() as i32,
+            bottom: (y + thumb_h).ceil() as i32,
         }
     }
 
@@ -128,5 +128,60 @@ impl CanvasState {
         // Pan so cell center = screen center
         self.pan_x = screen_cx - cell_cx;
         self.pan_y = screen_cy - cell_cy;
+    }
+
+    pub fn scroll_into_view(&mut self, index: usize) {
+        let r = self.grid_rect(index);
+        let title_h = (TITLE_H * self.zoom).ceil() as i32;
+        let margin = (CELL_PADDING * self.zoom).ceil() as i32;
+
+        // Cell bounds including title
+        let cell_left = r.left;
+        let cell_top = r.top;
+        let cell_right = r.right;
+        let cell_bottom = r.bottom + 2 + title_h;
+
+        let cell_w = cell_right - cell_left;
+        let cell_h = cell_bottom - cell_top;
+
+        // Visible region with margin inset
+        let view_left = margin;
+        let view_top = SEARCH_BAR_H as i32 + margin;
+        let view_right = self.canvas_w as i32 - margin;
+        let view_bottom = self.canvas_h as i32 - margin;
+
+        let view_w = view_right - view_left;
+        let view_h = view_bottom - view_top;
+
+        // If fully visible, do nothing
+        if cell_left >= view_left && cell_right <= view_right
+            && cell_top >= view_top && cell_bottom <= view_bottom
+        {
+            return;
+        }
+
+        // Pan minimum amount per axis. If cell is larger than viewport, pin leading edge.
+        let dx = if cell_w > view_w {
+            view_left - cell_left
+        } else if cell_left < view_left {
+            view_left - cell_left
+        } else if cell_right > view_right {
+            view_right - cell_right
+        } else {
+            0
+        };
+
+        let dy = if cell_h > view_h {
+            view_top - cell_top
+        } else if cell_top < view_top {
+            view_top - cell_top
+        } else if cell_bottom > view_bottom {
+            view_bottom - cell_bottom
+        } else {
+            0
+        };
+
+        self.pan_x += dx as f64;
+        self.pan_y += dy as f64;
     }
 }

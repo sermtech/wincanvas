@@ -18,8 +18,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, MOD_CONTROL, MOD_NOREPEAT, VK_BACK, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN,
-    VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
+    GetKeyState, RegisterHotKey, MOD_CONTROL, MOD_NOREPEAT, VK_BACK, VK_CONTROL, VK_DOWN,
+    VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::Foundation::RECT;
@@ -228,12 +228,20 @@ thread_local! {
     static CONTEXT_MENU_TARGET: RefCell<Option<usize>> = RefCell::new(None);
 }
 
-fn select_and_center(state: &mut AppState, idx: Option<usize>) {
+fn select_and_navigate(state: &mut AppState, idx: Option<usize>, center: bool) {
     state.selected = idx;
     if let Some(i) = idx {
-        state.canvas.center_on(i);
+        if center {
+            state.canvas.center_on(i);
+        } else {
+            state.canvas.scroll_into_view(i);
+        }
         update_all_thumbnails(state);
     }
+}
+
+fn ctrl_held() -> bool {
+    unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 }
 }
 
 fn clamp_selection(sel: Option<usize>, count: usize) -> Option<usize> {
@@ -484,7 +492,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 Some(_) => 0,
                                 None => 0,
                             };
-                            select_and_center(state, Some(idx));
+                            select_and_navigate(state, Some(idx), ctrl_held());
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
@@ -499,7 +507,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 Some(s) => s - 1,
                                 None => 0,
                             };
-                            select_and_center(state, Some(idx));
+                            select_and_navigate(state, Some(idx), ctrl_held());
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
@@ -517,7 +525,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 }
                                 None => 0,
                             };
-                            select_and_center(state, Some(idx));
+                            select_and_navigate(state, Some(idx), ctrl_held());
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
@@ -537,7 +545,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 }
                                 None => 0,
                             };
-                            select_and_center(state, Some(idx));
+                            select_and_navigate(state, Some(idx), ctrl_held());
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
