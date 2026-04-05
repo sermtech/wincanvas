@@ -18,7 +18,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, MOD_CONTROL, MOD_NOREPEAT, VK_BACK, VK_ESCAPE, VK_SPACE,
+    RegisterHotKey, MOD_CONTROL, MOD_NOREPEAT, VK_BACK, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN,
+    VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::Foundation::RECT;
@@ -31,6 +32,10 @@ struct AppState {
     render: Option<RenderContext>,
     windows: Vec<WindowInfo>,
     filtered_indices: Vec<usize>,
+    selected: Option<usize>,
+    hovered: Option<usize>,
+    right_click_start: Option<(i32, i32)>,
+    did_pan: bool,
     hwnd: HWND,
     visible: bool,
 }
@@ -101,6 +106,10 @@ fn main() {
             render: Some(render),
             windows: Vec::new(),
             filtered_indices: Vec::new(),
+            selected: None,
+            hovered: None,
+            right_click_start: None,
+            did_pan: false,
             hwnd: hwnd,
             visible: true,
         };
@@ -135,6 +144,9 @@ fn refresh_windows(state: &mut AppState) {
 
     // Enumerate new windows
     let mut windows = enumerate_windows_v2(state.hwnd);
+
+    // Sort by z-order (EnumWindows already returns in z-order, most recent first)
+    // No extra work needed -- EnumWindows gives us top-to-bottom z-order
 
     // Register thumbnails
     for w in &mut windows {
@@ -181,6 +193,59 @@ fn update_all_thumbnails(state: &AppState) {
     }
 }
 
+const CMD_CLOSE: u32 = 1001;
+const CMD_MINIMIZE: u32 = 1002;
+const CMD_MAXIMIZE: u32 = 1003;
+const CMD_RESTORE: u32 = 1004;
+
+fn show_context_menu(hwnd: HWND, x: i32, y: i32, win_idx: usize, _state: &AppState) {
+    unsafe {
+        let menu = CreatePopupMenu().unwrap();
+        let close_text: Vec<u16> = "Close\0".encode_utf16().collect();
+        let min_text: Vec<u16> = "Minimize\0".encode_utf16().collect();
+        let max_text: Vec<u16> = "Maximize\0".encode_utf16().collect();
+        let restore_text: Vec<u16> = "Restore\0".encode_utf16().collect();
+
+        let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), CMD_RESTORE as usize, PCWSTR(restore_text.as_ptr()));
+        let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), CMD_MINIMIZE as usize, PCWSTR(min_text.as_ptr()));
+        let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), CMD_MAXIMIZE as usize, PCWSTR(max_text.as_ptr()));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR(std::ptr::null()));
+        let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), CMD_CLOSE as usize, PCWSTR(close_text.as_ptr()));
+
+        // Store the target window index for WM_COMMAND
+        CONTEXT_MENU_TARGET.with(|t| *t.borrow_mut() = Some(win_idx));
+
+        // Convert client coords to screen coords
+        let mut pt = windows::Win32::Foundation::POINT { x, y };
+        let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut pt);
+
+        let _ = TrackPopupMenu(menu, TRACK_POPUP_MENU_FLAGS(0), pt.x, pt.y, Some(0), hwnd, None);
+        let _ = DestroyMenu(menu);
+    }
+}
+
+thread_local! {
+    static CONTEXT_MENU_TARGET: RefCell<Option<usize>> = RefCell::new(None);
+}
+
+fn clamp_selection(sel: Option<usize>, count: usize) -> Option<usize> {
+    match sel {
+        Some(_) if count == 0 => None,
+        Some(s) if s >= count => Some(count - 1),
+        other => other,
+    }
+}
+
+fn state_search_active() -> bool {
+    APP.with(|app| {
+        if let Some(ref state) = *app.borrow() {
+            state.search.is_active()
+        } else {
+            false
+        }
+    })
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_PAINT => {
@@ -190,18 +255,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         render.begin_draw();
                         render.draw_search_bar(&state.search.query, state.canvas.canvas_w);
 
-                        // Draw cell borders and titles
+                        // Draw cell borders, titles, selection, hover, badges
                         for (grid_idx, &win_idx) in state.filtered_indices.iter().enumerate() {
                             let thumb_rect = state.canvas.grid_rect(grid_idx);
-                            render.draw_cell_border(thumb_rect);
+
+                            if state.selected == Some(grid_idx) {
+                                render.draw_selection_border(thumb_rect);
+                            } else if state.hovered == Some(grid_idx) {
+                                render.draw_hover_border(thumb_rect);
+                            } else {
+                                render.draw_cell_border(thumb_rect);
+                            }
+
+                            // Number badges for first 9 windows
+                            if grid_idx < 9 {
+                                render.draw_number_badge(thumb_rect, grid_idx + 1);
+                            }
 
                             let title_rect = state.canvas.title_rect(grid_idx);
-                            let title = &state.windows[win_idx].title;
-                            // Truncate title for display
-                            let display_title = if title.len() > 40 {
-                                format!("{}...", &title[..37])
+                            let winfo = &state.windows[win_idx];
+                            let full = format!("[{}] {}", winfo.process_name, winfo.title);
+                            let display_title = if full.len() > 45 {
+                                format!("{}...", &full[..42])
                             } else {
-                                title.clone()
+                                full
                             };
                             render.draw_title(&display_title, title_rect);
                         }
@@ -229,38 +306,82 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
 
         WM_RBUTTONDOWN => {
+            let mx = (lparam.0 & 0xFFFF) as i16 as i32;
+            let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             APP.with(|app| {
                 if let Some(ref mut state) = *app.borrow_mut() {
                     state.canvas.is_panning = true;
-                    state.canvas.last_mouse_x = (lparam.0 & 0xFFFF) as i16 as i32;
-                    state.canvas.last_mouse_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                    state.canvas.last_mouse_x = mx;
+                    state.canvas.last_mouse_y = my;
+                    state.right_click_start = Some((mx, my));
+                    state.did_pan = false;
                 }
             });
             LRESULT(0)
         }
 
         WM_RBUTTONUP => {
+            let mx = (lparam.0 & 0xFFFF) as i16 as i32;
+            let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             APP.with(|app| {
                 if let Some(ref mut state) = *app.borrow_mut() {
                     state.canvas.is_panning = false;
+                    // If we didn't pan (just a click), show context menu
+                    if !state.did_pan {
+                        let count = state.filtered_indices.len();
+                        if let Some(grid_idx) = state.canvas.hit_test(mx, my, count) {
+                            let win_idx = state.filtered_indices[grid_idx];
+                            show_context_menu(hwnd, mx, my, win_idx, state);
+                        }
+                    }
+                    state.right_click_start = None;
                 }
             });
             LRESULT(0)
         }
 
         WM_MOUSEMOVE => {
+            let mx = (lparam.0 & 0xFFFF) as i16 as i32;
+            let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             APP.with(|app| {
                 if let Some(ref mut state) = *app.borrow_mut() {
                     if state.canvas.is_panning {
-                        let mx = (lparam.0 & 0xFFFF) as i16 as i32;
-                        let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
                         let dx = mx - state.canvas.last_mouse_x;
                         let dy = my - state.canvas.last_mouse_y;
+                        if dx.abs() > 3 || dy.abs() > 3 {
+                            state.did_pan = true;
+                        }
                         state.canvas.pan(dx, dy);
                         state.canvas.last_mouse_x = mx;
                         state.canvas.last_mouse_y = my;
                         update_all_thumbnails(state);
                         let _ = InvalidateRect(Some(hwnd), None, false);
+                    } else {
+                        // Hover tracking
+                        let count = state.filtered_indices.len();
+                        let new_hover = state.canvas.hit_test(mx, my, count);
+                        if new_hover != state.hovered {
+                            state.hovered = new_hover;
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    }
+                }
+            });
+            LRESULT(0)
+        }
+
+        WM_MBUTTONDOWN => {
+            // Middle-click: close the target window
+            let mx = (lparam.0 & 0xFFFF) as i16 as i32;
+            let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            APP.with(|app| {
+                if let Some(ref mut state) = *app.borrow_mut() {
+                    let count = state.filtered_indices.len();
+                    if let Some(grid_idx) = state.canvas.hit_test(mx, my, count) {
+                        let win_idx = state.filtered_indices[grid_idx];
+                        let target_hwnd = state.windows[win_idx].hwnd;
+                        let _ = PostMessageW(Some(target_hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                        // Refresh after a short delay (timer will catch it)
                     }
                 }
             });
@@ -310,6 +431,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if let Some(ref mut state) = *app.borrow_mut() {
                         state.search.pop();
                         update_filter(state);
+                        state.selected = clamp_selection(state.selected, state.filtered_indices.len());
                         update_all_thumbnails(state);
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
@@ -320,11 +442,121 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         if state.search.is_active() {
                             state.search.clear();
                             update_filter(state);
+                            state.selected = clamp_selection(state.selected, state.filtered_indices.len());
                             update_all_thumbnails(state);
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         } else {
                             let _ = ShowWindow(hwnd, SW_HIDE);
                             state.visible = false;
+                        }
+                    }
+                });
+            } else if vk == VK_RETURN.0 {
+                // Enter: activate selected window
+                APP.with(|app| {
+                    if let Some(ref mut state) = *app.borrow_mut() {
+                        if let Some(sel) = state.selected {
+                            if sel < state.filtered_indices.len() {
+                                let win_idx = state.filtered_indices[sel];
+                                let target_hwnd = state.windows[win_idx].hwnd;
+                                let _ = ShowWindow(hwnd, SW_HIDE);
+                                state.visible = false;
+                                let _ = SetForegroundWindow(target_hwnd);
+                            }
+                        }
+                    }
+                });
+            } else if vk == VK_TAB.0 {
+                // Tab: cycle forward through windows
+                APP.with(|app| {
+                    if let Some(ref mut state) = *app.borrow_mut() {
+                        let count = state.filtered_indices.len();
+                        if count > 0 {
+                            state.selected = Some(match state.selected {
+                                Some(s) => (s + 1) % count,
+                                None => 0,
+                            });
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    }
+                });
+            } else if vk == VK_RIGHT.0 {
+                APP.with(|app| {
+                    if let Some(ref mut state) = *app.borrow_mut() {
+                        let count = state.filtered_indices.len();
+                        if count > 0 {
+                            state.selected = Some(match state.selected {
+                                Some(s) if s + 1 < count => s + 1,
+                                Some(_) => 0,
+                                None => 0,
+                            });
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    }
+                });
+            } else if vk == VK_LEFT.0 {
+                APP.with(|app| {
+                    if let Some(ref mut state) = *app.borrow_mut() {
+                        let count = state.filtered_indices.len();
+                        if count > 0 {
+                            state.selected = Some(match state.selected {
+                                Some(0) => count - 1,
+                                Some(s) => s - 1,
+                                None => 0,
+                            });
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    }
+                });
+            } else if vk == VK_DOWN.0 {
+                APP.with(|app| {
+                    if let Some(ref mut state) = *app.borrow_mut() {
+                        let count = state.filtered_indices.len();
+                        let cols = state.canvas.cols();
+                        if count > 0 {
+                            state.selected = Some(match state.selected {
+                                Some(s) => {
+                                    let next = s + cols;
+                                    if next < count { next } else { s % cols }
+                                }
+                                None => 0,
+                            });
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    }
+                });
+            } else if vk == VK_UP.0 {
+                APP.with(|app| {
+                    if let Some(ref mut state) = *app.borrow_mut() {
+                        let count = state.filtered_indices.len();
+                        let cols = state.canvas.cols();
+                        if count > 0 {
+                            state.selected = Some(match state.selected {
+                                Some(s) if s >= cols => s - cols,
+                                Some(s) => {
+                                    // Wrap to last row, same column
+                                    let last_row_start = (count / cols) * cols;
+                                    let target = last_row_start + s;
+                                    if target < count { target } else if target >= cols { target - cols } else { s }
+                                }
+                                None => 0,
+                            });
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    }
+                });
+            } else if vk >= 0x31 && vk <= 0x39 && !state_search_active() {
+                // Number keys 1-9: instant switch (only when not searching)
+                let num = (vk - 0x30) as usize;
+                APP.with(|app| {
+                    if let Some(ref mut state) = *app.borrow_mut() {
+                        let idx = num - 1;
+                        if idx < state.filtered_indices.len() {
+                            let win_idx = state.filtered_indices[idx];
+                            let target_hwnd = state.windows[win_idx].hwnd;
+                            let _ = ShowWindow(hwnd, SW_HIDE);
+                            state.visible = false;
+                            let _ = SetForegroundWindow(target_hwnd);
                         }
                     }
                 });
@@ -343,6 +575,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let _ = ShowWindow(hwnd, SW_SHOW);
                             let _ = SetForegroundWindow(hwnd);
                             state.visible = true;
+                            state.selected = None;
+                            state.hovered = None;
+                            state.search.clear();
                             refresh_windows(state);
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
@@ -376,6 +611,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if let Some(ref mut render) = state.render {
                         render.resize(w, h);
                     }
+                }
+            });
+            LRESULT(0)
+        }
+
+        WM_COMMAND => {
+            let cmd = (wparam.0 & 0xFFFF) as u32;
+            CONTEXT_MENU_TARGET.with(|t| {
+                if let Some(win_idx) = *t.borrow() {
+                    APP.with(|app| {
+                        if let Some(ref state) = *app.borrow() {
+                            if win_idx < state.windows.len() {
+                                let target = state.windows[win_idx].hwnd;
+                                match cmd {
+                                    CMD_CLOSE => { let _ = PostMessageW(Some(target), WM_CLOSE, WPARAM(0), LPARAM(0)); }
+                                    CMD_MINIMIZE => { let _ = ShowWindow(target, SW_MINIMIZE); }
+                                    CMD_MAXIMIZE => { let _ = ShowWindow(target, SW_MAXIMIZE); }
+                                    CMD_RESTORE => { let _ = ShowWindow(target, SW_RESTORE); }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    });
                 }
             });
             LRESULT(0)

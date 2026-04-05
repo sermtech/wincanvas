@@ -26,6 +26,11 @@ pub struct RenderContext {
     pub search_bg_brush: ID2D1SolidColorBrush,
     pub search_text_brush: ID2D1SolidColorBrush,
     pub highlight_brush: ID2D1SolidColorBrush,
+    pub selection_brush: ID2D1SolidColorBrush,
+    pub hover_brush: ID2D1SolidColorBrush,
+    pub badge_brush: ID2D1SolidColorBrush,
+    pub badge_text_brush: ID2D1SolidColorBrush,
+    pub badge_format: IDWriteTextFormat,
     pub dwrite_factory: IDWriteFactory,
     pub title_format: IDWriteTextFormat,
     pub search_format: IDWriteTextFormat,
@@ -76,6 +81,22 @@ impl RenderContext {
                 .CreateSolidColorBrush(&color(0.3, 0.3, 0.5, 0.5), None)
                 .unwrap();
 
+            let selection_brush = target
+                .CreateSolidColorBrush(&color(0.2, 0.7, 1.0, 1.0), None)
+                .unwrap();
+
+            let hover_brush = target
+                .CreateSolidColorBrush(&color(0.5, 0.5, 0.7, 0.7), None)
+                .unwrap();
+
+            let badge_brush = target
+                .CreateSolidColorBrush(&color(0.2, 0.7, 1.0, 0.9), None)
+                .unwrap();
+
+            let badge_text_brush = target
+                .CreateSolidColorBrush(&color(0.0, 0.0, 0.0, 1.0), None)
+                .unwrap();
+
             let dwrite_factory: IDWriteFactory =
                 DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap();
 
@@ -111,6 +132,21 @@ impl RenderContext {
 
             let _ = search_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
+            let badge_format = dwrite_factory
+                .CreateTextFormat(
+                    PCWSTR(font_name.as_ptr()),
+                    None,
+                    DWRITE_FONT_WEIGHT_NORMAL,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    14.0,
+                    PCWSTR(locale.as_ptr()),
+                )
+                .unwrap();
+
+            let _ = badge_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            let _ = badge_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
             Self {
                 factory,
                 target,
@@ -119,9 +155,14 @@ impl RenderContext {
                 search_bg_brush,
                 search_text_brush,
                 highlight_brush,
+                selection_brush,
+                hover_brush,
+                badge_brush,
+                badge_text_brush,
                 dwrite_factory,
                 title_format,
                 search_format,
+                badge_format,
             }
         }
     }
@@ -221,6 +262,62 @@ impl RenderContext {
             };
             self.target
                 .DrawRectangle(&d2d_rect, &self.highlight_brush, 1.0, None);
+        }
+    }
+
+    pub fn draw_hover_border(&self, rect: RECT) {
+        unsafe {
+            let d2d_rect = D2D_RECT_F {
+                left: rect.left as f32 - 2.0,
+                top: rect.top as f32 - 2.0,
+                right: rect.right as f32 + 2.0,
+                bottom: rect.bottom as f32 + 2.0,
+            };
+            self.target
+                .DrawRectangle(&d2d_rect, &self.hover_brush, 2.0, None);
+        }
+    }
+
+    pub fn draw_number_badge(&self, rect: RECT, num: usize) {
+        unsafe {
+            let badge_size: f32 = 22.0;
+            let badge_rect = D2D_RECT_F {
+                left: rect.left as f32 + 4.0,
+                top: rect.top as f32 + 4.0,
+                right: rect.left as f32 + 4.0 + badge_size,
+                bottom: rect.top as f32 + 4.0 + badge_size,
+            };
+            // Draw badge background circle (rounded rect approximation)
+            let rounded = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT {
+                rect: badge_rect,
+                radiusX: badge_size / 2.0,
+                radiusY: badge_size / 2.0,
+            };
+            self.target.FillRoundedRectangle(&rounded, &self.badge_brush);
+
+            let text = format!("{}", num);
+            let text_u16: Vec<u16> = text.encode_utf16().collect();
+            self.target.DrawText(
+                &text_u16,
+                &self.badge_format,
+                &badge_rect,
+                &self.badge_text_brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE(0),
+            );
+        }
+    }
+
+    pub fn draw_selection_border(&self, rect: RECT) {
+        unsafe {
+            let d2d_rect = D2D_RECT_F {
+                left: rect.left as f32 - 3.0,
+                top: rect.top as f32 - 3.0,
+                right: rect.right as f32 + 3.0,
+                bottom: rect.bottom as f32 + 3.0,
+            };
+            self.target
+                .DrawRectangle(&d2d_rect, &self.selection_brush, 2.5, None);
         }
     }
 }

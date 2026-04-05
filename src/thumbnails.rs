@@ -3,6 +3,9 @@ use windows::Win32::Graphics::Dwm::{
     DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
     DWM_THUMBNAIL_PROPERTIES,
 };
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
     IsWindowVisible, GWL_EXSTYLE, GWL_STYLE, WS_EX_TOOLWINDOW, WS_CHILD,
@@ -17,7 +20,28 @@ const DWM_TNP_OPACITY: u32 = 0x4;
 pub struct WindowInfo {
     pub hwnd: HWND,
     pub title: String,
+    pub process_name: String,
+    pub pid: u32,
     pub thumbnail: Option<isize>,
+}
+
+fn get_process_name(pid: u32) -> String {
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        if let Ok(handle) = handle {
+            let mut buf = [0u16; 260];
+            let mut size = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(handle, PROCESS_NAME_FORMAT(0), windows::core::PWSTR(buf.as_mut_ptr()), &mut size);
+            let _ = windows::Win32::Foundation::CloseHandle(handle);
+            if ok.is_ok() {
+                let path = String::from_utf16_lossy(&buf[..size as usize]);
+                if let Some(name) = path.rsplit('\\').next() {
+                    return name.trim_end_matches(".exe").to_string();
+                }
+            }
+        }
+        "unknown".to_string()
+    }
 }
 
 struct EnumData {
@@ -85,9 +109,12 @@ unsafe extern "system" fn enum_callback_v2(
     GetWindowTextW(hwnd, &mut buf);
     let title = String::from_utf16_lossy(&buf[..len as usize]);
 
+    let process_name = get_process_name(pid);
     data.windows.push(WindowInfo {
         hwnd,
         title,
+        process_name,
+        pid,
         thumbnail: None,
     });
 
