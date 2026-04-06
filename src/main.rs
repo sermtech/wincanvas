@@ -84,6 +84,12 @@ fn main() {
         // Must be the very first Win32 call -- enables physical pixel coordinates everywhere
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).unwrap();
 
+        // Initialize COM for IVirtualDesktopManager (virtual desktop filtering)
+        let _ = windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+        );
+
         let hinstance = GetModuleHandleW(None).unwrap();
 
         let class_name: Vec<u16> = "WinCanvasClass\0".encode_utf16().collect();
@@ -490,6 +496,23 @@ fn apply_pin_hole(state: &mut AppState) {
     }
 }
 
+/// Lightweight repositioning of the pinned window + hole during pan (no debug logging).
+fn update_pin_position(state: &mut AppState) {
+    if let Some(ref focus) = state.pin_focus {
+        let grid_idx = focus.grid_idx;
+        let target = focus.target_hwnd;
+        if grid_idx >= state.canvas.layout.len() || grid_idx >= state.filtered_indices.len() {
+            return;
+        }
+        let tr = state.canvas.thumb_rect(grid_idx);
+        let (px, py, pw, ph) = compute_client_aligned_rect(target, &tr);
+        unsafe {
+            let _ = SetWindowPos(target, Some(HWND_TOP), px, py, pw, ph, SWP_NOACTIVATE);
+        }
+        apply_region_hole(state.hwnd, &tr);
+    }
+}
+
 fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
     // Exit any existing pin focus first (clears hole and animates back if needed)
     exit_pin_focus(state);
@@ -680,12 +703,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             APP.with(|app| {
                 if let Some(ref mut state) = *app.borrow_mut() {
-                    // Pin focus active (or animating in): ignore right-click pan
-                    if state.pin_focus.is_some() || state.pin_zoom_pending {
+                    // Animating zoom-in: ignore right-click pan
+                    if state.pin_zoom_pending {
                         return;
                     }
-                    state.canvas.anim.active = false;
-                    let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
+                    if state.pin_focus.is_none() {
+                        state.canvas.anim.active = false;
+                        let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
+                    }
                     state.canvas.is_panning = true;
                     state.canvas.last_mouse_x = mx;
                     state.canvas.last_mouse_y = my;
@@ -701,11 +726,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             APP.with(|app| {
                 if let Some(ref mut state) = *app.borrow_mut() {
-                    if state.pin_focus.is_some() || state.pin_zoom_pending {
+                    if state.pin_zoom_pending {
                         return;
                     }
                     state.canvas.is_panning = false;
-                    if !state.did_pan && !state.pin_mode {
+                    if !state.did_pan && !state.pin_mode && state.pin_focus.is_none() {
                         let count = state.filtered_indices.len();
                         if let Some(grid_idx) = state.canvas.hit_test(mx, my, count) {
                             let win_idx = state.filtered_indices[grid_idx];
@@ -733,9 +758,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         state.canvas.last_mouse_x = mx;
                         state.canvas.last_mouse_y = my;
                         update_all_thumbnails(state);
+                        if state.pin_focus.is_some() {
+                            update_pin_position(state);
+                        }
                         let _ = InvalidateRect(Some(hwnd), None, false);
-                    } else if state.pin_focus.is_some() {
-                        // Pin focus active: mouse moves pass through the region hole
                     } else if state.drag.is_some() {
                         let drag = state.drag.as_mut().unwrap();
                         if !drag.active {

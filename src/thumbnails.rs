@@ -3,9 +3,11 @@ use windows::Win32::Graphics::Dwm::{
     DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
     DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES,
 };
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClientRect, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
     GetWindowThreadProcessId, IsWindowVisible, GWL_EXSTYLE, GWL_STYLE, WS_EX_TOOLWINDOW, WS_CHILD,
@@ -53,6 +55,7 @@ struct EnumData {
     windows: Vec<WindowInfo>,
     our_hwnd: HWND,
     our_pid: u32,
+    vdm: Option<IVirtualDesktopManager>,
 }
 
 pub fn enumerate_windows_v2(our_hwnd: HWND) -> Vec<WindowInfo> {
@@ -61,10 +64,14 @@ pub fn enumerate_windows_v2(our_hwnd: HWND) -> Vec<WindowInfo> {
         GetWindowThreadProcessId(our_hwnd, Some(&mut pid));
         pid
     };
+    let vdm: Option<IVirtualDesktopManager> = unsafe {
+        CoCreateInstance(&VirtualDesktopManager, None, CLSCTX_ALL).ok()
+    };
     let mut data = EnumData {
         windows: Vec::new(),
         our_hwnd,
         our_pid,
+        vdm,
     };
     unsafe {
         let _ = EnumWindows(
@@ -108,6 +115,15 @@ unsafe extern "system" fn enum_callback_v2(
     GetWindowThreadProcessId(hwnd, Some(&mut pid));
     if pid == data.our_pid {
         return windows::core::BOOL(1);
+    }
+
+    // Skip windows on other virtual desktops
+    if let Some(ref vdm) = data.vdm {
+        if let Ok(on_current) = vdm.IsWindowOnCurrentVirtualDesktop(hwnd) {
+            if !on_current.as_bool() {
+                return windows::core::BOOL(1);
+            }
+        }
     }
 
     let mut buf = vec![0u16; (len + 1) as usize];
