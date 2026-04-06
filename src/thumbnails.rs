@@ -156,7 +156,7 @@ pub fn query_client_area_size(hwnd: HWND) -> (i32, i32) {
     }
 }
 
-pub fn update_thumbnail(thumb: isize, dest_rect: RECT, source_w: i32, source_h: i32) {
+pub fn update_thumbnail(thumb: isize, dest_rect: RECT, source_w: i32, source_h: i32, opacity: u8) {
     let has_source = source_w > 0 && source_h > 0;
     let mut flags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
     if has_source {
@@ -172,7 +172,7 @@ pub fn update_thumbnail(thumb: isize, dest_rect: RECT, source_w: i32, source_h: 
             bottom: source_h,
         },
         fVisible: windows::core::BOOL(1),
-        opacity: 255,
+        opacity,
         fSourceClientAreaOnly: windows::core::BOOL(1),
         ..Default::default()
     };

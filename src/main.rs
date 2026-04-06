@@ -15,22 +15,31 @@ use thumbnails::{
 
 use std::cell::RefCell;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::{ClientToScreen, InvalidateRect, ValidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, RegisterHotKey, MOD_CONTROL, MOD_NOREPEAT, VK_BACK, VK_CONTROL, VK_DOWN,
-    VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
+    GetKeyState, RegisterHotKey, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT, VK_BACK,
+    VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::Foundation::RECT;
 
 const HOTKEY_ID: i32 = 1;
+const PIN_F1_HOTKEY_ID: i32 = 2;
+const PIN_ESC_HOTKEY_ID: i32 = 3;
 const TIMER_ID: usize = 1;
 const ANIM_TIMER_ID: usize = 2;
 const ANIM_INTERVAL_MS: u32 = 16;
+
+struct PinFocusState {
+    grid_idx: usize,
+    target_hwnd: HWND,
+    saved_placement: WINDOWPLACEMENT,
+    was_topmost: bool,
+}
 
 struct DragState {
     grid_idx: usize,
@@ -51,6 +60,8 @@ struct AppState {
     did_pan: bool,
     drag: Option<DragState>,
     custom_order: Vec<isize>,
+    pin_mode: bool,
+    pin_focus: Option<PinFocusState>,
     hwnd: HWND,
     visible: bool,
     qpc_freq: i64,
@@ -133,6 +144,8 @@ fn main() {
             did_pan: false,
             drag: None,
             custom_order: Vec::new(),
+            pin_mode: false,
+            pin_focus: None,
             hwnd: hwnd,
             visible: true,
             qpc_freq,
@@ -236,14 +249,13 @@ fn update_all_thumbnails(state: &AppState) {
     for (i, w) in state.windows.iter().enumerate() {
         if let Some(thumb) = w.thumbnail {
             if !state.filtered_indices.contains(&i) {
-                // Hide this thumbnail by setting a zero-size rect off-screen
                 let hide_rect = RECT {
                     left: -1,
                     top: -1,
                     right: -1,
                     bottom: -1,
                 };
-                update_thumbnail(thumb, hide_rect, 0, 0);
+                update_thumbnail(thumb, hide_rect, 0, 0, 0);
             }
         }
     }
@@ -261,7 +273,8 @@ fn update_all_thumbnails(state: &AppState) {
             } else {
                 (w.source_w, w.source_h)
             };
-            update_thumbnail(thumb, tr, cw, ch);
+            let opacity = 255u8;
+            update_thumbnail(thumb, tr, cw, ch, opacity);
         }
     }
 }
@@ -318,6 +331,105 @@ fn select_and_navigate(state: &mut AppState, idx: Option<usize>, center: bool) {
     }
 }
 
+/// Compute the window rect so the target's client area aligns with `client_target` on screen.
+fn compute_client_aligned_rect(hwnd: HWND, client_target: &RECT) -> (i32, i32, i32, i32) {
+    unsafe {
+        let mut wr = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut wr);
+        let mut cp = POINT { x: 0, y: 0 };
+        let _ = ClientToScreen(hwnd, &mut cp);
+        let mut cr = RECT::default();
+        let _ = GetClientRect(hwnd, &mut cr);
+
+        let bl = cp.x - wr.left;
+        let bt = cp.y - wr.top;
+        let br = wr.right - (cp.x + cr.right);
+        let bb = wr.bottom - (cp.y + cr.bottom);
+
+        let x = client_target.left - bl;
+        let y = client_target.top - bt;
+        let w = (client_target.right - client_target.left) + bl + br;
+        let h = (client_target.bottom - client_target.top) + bt + bb;
+        (x, y, w, h)
+    }
+}
+
+fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
+    // Exit any existing pin focus first
+    exit_pin_focus(state);
+
+    let win_idx = state.filtered_indices[grid_idx];
+    let target = state.windows[win_idx].hwnd;
+
+    // Save original placement
+    let mut placement = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    unsafe { let _ = GetWindowPlacement(target, &mut placement); }
+
+    // Check if target is TOPMOST and remove it if so
+    let ex_style = unsafe { GetWindowLongW(target, GWL_EXSTYLE) } as u32;
+    let was_topmost = ex_style & WS_EX_TOPMOST.0 != 0;
+    if was_topmost {
+        unsafe {
+            let _ = SetWindowPos(
+                target, Some(HWND_NOTOPMOST), 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    // Align target's client area with thumb_rect
+    let tr = state.canvas.thumb_rect(grid_idx);
+    let (px, py, pw, ph) = compute_client_aligned_rect(target, &tr);
+
+    unsafe {
+        let _ = SetWindowPos(
+            target, Some(HWND_TOP), px, py, pw, ph,
+            SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS | SWP_FRAMECHANGED,
+        );
+
+        // Give keyboard focus to target
+        let _ = SetForegroundWindow(target);
+
+        // Register F1 and Escape as global hotkeys for exiting pin focus
+        let _ = RegisterHotKey(Some(state.hwnd), PIN_F1_HOTKEY_ID, MOD_NOREPEAT, 0x70);
+        let _ = RegisterHotKey(Some(state.hwnd), PIN_ESC_HOTKEY_ID, MOD_NOREPEAT, VK_ESCAPE.0 as u32);
+    }
+
+    state.pin_focus = Some(PinFocusState {
+        grid_idx,
+        target_hwnd: target,
+        saved_placement: placement,
+        was_topmost,
+    });
+}
+
+fn exit_pin_focus(state: &mut AppState) {
+    if let Some(focus) = state.pin_focus.take() {
+        unsafe {
+            // Restore original position/size
+            if IsWindow(Some(focus.target_hwnd)).as_bool() {
+                let _ = SetWindowPlacement(focus.target_hwnd, &focus.saved_placement);
+                // Restore TOPMOST if it was originally set
+                if focus.was_topmost {
+                    let _ = SetWindowPos(
+                        focus.target_hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            }
+            // Unregister pin hotkeys
+            let _ = UnregisterHotKey(Some(state.hwnd), PIN_F1_HOTKEY_ID);
+            let _ = UnregisterHotKey(Some(state.hwnd), PIN_ESC_HOTKEY_ID);
+            // Refocus overlay
+            let _ = SetForegroundWindow(state.hwnd);
+        }
+        update_all_thumbnails(state);
+    }
+}
+
 fn ctrl_held() -> bool {
     unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 }
 }
@@ -330,16 +442,6 @@ fn clamp_selection(sel: Option<usize>, count: usize) -> Option<usize> {
     }
 }
 
-fn state_search_active() -> bool {
-    APP.with(|app| {
-        if let Some(ref state) = *app.borrow() {
-            state.search.is_active()
-        } else {
-            false
-        }
-    })
-}
-
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_PAINT => {
@@ -349,6 +451,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         render.begin_draw();
                         render.draw_search_bar(&state.search.query, state.canvas.canvas_w);
 
+                        // Pin button (always visible)
+                        let pin_rect = state.canvas.pin_button_rect();
+                        render.draw_pin_button(pin_rect, state.pin_mode);
+
                         // Draw cell borders, titles, selection, hover, badges
                         for (grid_idx, &win_idx) in state.filtered_indices.iter().enumerate() {
                             if grid_idx >= state.canvas.layout.len() {
@@ -357,7 +463,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let cr = state.canvas.cell_rect(grid_idx);
                             let winfo = &state.windows[win_idx];
 
-                            if state.selected == Some(grid_idx) {
+                            if state.pin_mode && state.pin_focus.as_ref().map(|f| f.grid_idx) == Some(grid_idx) {
+                                render.draw_pin_focus_border(cr);
+                            } else if state.selected == Some(grid_idx) {
                                 render.draw_selection_border(cr);
                             } else if state.hovered == Some(grid_idx) {
                                 render.draw_hover_border(cr);
@@ -390,16 +498,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
 
         WM_MOUSEWHEEL => {
-            let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
             let mx = (lparam.0 & 0xFFFF) as i16 as i32;
             let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             APP.with(|app| {
                 if let Some(ref mut state) = *app.borrow_mut() {
+                    // Pin focus active: ignore scroll on overlay (target gets it via focus)
+                    if state.pin_focus.is_some() {
+                        return;
+                    }
+                    let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
                     state.canvas.anim.active = false;
                     let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
                     state.canvas.zoom_at(mx, my, delta);
-                    // No recompute_layout here -- zoom is a pure visual transform,
-                    // layout positions are stable in world coordinates
                     update_all_thumbnails(state);
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
@@ -412,6 +522,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             APP.with(|app| {
                 if let Some(ref mut state) = *app.borrow_mut() {
+                    // Pin focus active: ignore (right-clicks pass through via HTTRANSPARENT)
+                    if state.pin_focus.is_some() {
+                        return;
+                    }
                     state.canvas.anim.active = false;
                     let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
                     state.canvas.is_panning = true;
@@ -429,9 +543,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             APP.with(|app| {
                 if let Some(ref mut state) = *app.borrow_mut() {
+                    if state.pin_focus.is_some() {
+                        return;
+                    }
                     state.canvas.is_panning = false;
-                    // If we didn't pan (just a click), show context menu
-                    if !state.did_pan {
+                    if !state.did_pan && !state.pin_mode {
                         let count = state.filtered_indices.len();
                         if let Some(grid_idx) = state.canvas.hit_test(mx, my, count) {
                             let win_idx = state.filtered_indices[grid_idx];
@@ -460,6 +576,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         state.canvas.last_mouse_y = my;
                         update_all_thumbnails(state);
                         let _ = InvalidateRect(Some(hwnd), None, false);
+                    } else if state.pin_focus.is_some() {
+                        // Pin focus active: mouse moves pass through via HTTRANSPARENT
                     } else if state.drag.is_some() {
                         let drag = state.drag.as_mut().unwrap();
                         if !drag.active {
@@ -514,7 +632,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             APP.with(|app| {
                 if let Some(ref mut state) = *app.borrow_mut() {
+                    // Check pin button click first
+                    let pin_r = state.canvas.pin_button_rect();
+                    if mx >= pin_r.left && mx <= pin_r.right && my >= pin_r.top && my <= pin_r.bottom {
+                        exit_pin_focus(state);
+                        state.pin_mode = !state.pin_mode;
+                        update_all_thumbnails(state);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        return;
+                    }
+
                     let count = state.filtered_indices.len();
+
+                    if state.pin_mode {
+                        // Clicks on focused window's thumb_rect never reach here
+                        // (HTTRANSPARENT passes them to the real window).
+                        // Clicks outside go here -- focus a new window or unfocus.
+                        if let Some(grid_idx) = state.canvas.hit_test(mx, my, count) {
+                            let already_focused = state.pin_focus.as_ref().map(|f| f.grid_idx) == Some(grid_idx);
+                            if !already_focused {
+                                enter_pin_focus(state, grid_idx);
+                                let _ = InvalidateRect(Some(hwnd), None, false);
+                            }
+                        } else {
+                            exit_pin_focus(state);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                        return;
+                    }
+
+                    // Normal mode
                     if let Some(grid_idx) = state.canvas.hit_test(mx, my, count) {
                         if ctrl_held() {
                             // Ctrl+click: start potential drag
@@ -545,6 +692,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             APP.with(|app| {
                 if let Some(ref mut state) = *app.borrow_mut() {
+                    // Pin focus: clicks pass through via HTTRANSPARENT
+                    if state.pin_focus.is_some() {
+                        return;
+                    }
                     if let Some(drag) = state.drag.take() {
                         if drag.active {
                             let count = state.filtered_indices.len();
@@ -569,32 +720,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
 
         WM_CHAR => {
-            let ch = char::from_u32(wparam.0 as u32);
-            if let Some(c) = ch {
-                if c >= ' ' && c != '\x7f' {
-                    APP.with(|app| {
-                        if let Some(ref mut state) = *app.borrow_mut() {
+            APP.with(|app| {
+                if let Some(ref mut state) = *app.borrow_mut() {
+                    // Pin focus: keyboard goes to target via SetForegroundWindow
+                    if state.pin_focus.is_some() {
+                        return;
+                    }
+                    // Normal: search input
+                    let ch = char::from_u32(wparam.0 as u32);
+                    if let Some(c) = ch {
+                        if c >= ' ' && c != '\x7f' {
                             state.search.push(c);
                             update_filter(state);
                             recompute_layout(state);
                             update_all_thumbnails(state);
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
-                    });
+                    }
                 }
-            }
+            });
             LRESULT(0)
         }
 
         WM_KEYDOWN => {
             let vk = wparam.0 as u16;
-            if vk == VK_BACK.0 {
+            // F1: toggle pin mode (only when overlay has focus, i.e. not in pin focus)
+            if vk == 0x70 {
                 APP.with(|app| {
                     if let Some(ref mut state) = *app.borrow_mut() {
-                        state.search.pop();
-                        update_filter(state);
-                        recompute_layout(state);
-                        state.selected = clamp_selection(state.selected, state.filtered_indices.len());
+                        exit_pin_focus(state);
+                        state.pin_mode = !state.pin_mode;
                         update_all_thumbnails(state);
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
@@ -602,7 +757,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else if vk == VK_ESCAPE.0 {
                 APP.with(|app| {
                     if let Some(ref mut state) = *app.borrow_mut() {
-                        if state.search.is_active() {
+                        if state.pin_mode {
+                            exit_pin_focus(state);
+                            state.pin_mode = false;
+                            update_all_thumbnails(state);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        } else if state.search.is_active() {
                             state.search.clear();
                             update_filter(state);
                             recompute_layout(state);
@@ -615,13 +775,84 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                     }
                 });
-            } else if vk == VK_RETURN.0 {
-                // Enter: activate selected window
+            } else if vk == VK_BACK.0 {
                 APP.with(|app| {
                     if let Some(ref mut state) = *app.borrow_mut() {
-                        if let Some(sel) = state.selected {
-                            if sel < state.filtered_indices.len() {
-                                let win_idx = state.filtered_indices[sel];
+                        if state.pin_focus.is_some() {
+                            return;
+                        }
+                        state.search.pop();
+                        update_filter(state);
+                        recompute_layout(state);
+                        state.selected = clamp_selection(state.selected, state.filtered_indices.len());
+                        update_all_thumbnails(state);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                });
+            } else {
+                APP.with(|app| {
+                    if let Some(ref mut state) = *app.borrow_mut() {
+                        // Pin focus: keyboard goes to target naturally
+                        if state.pin_focus.is_some() {
+                            return;
+                        }
+                        if vk == VK_RETURN.0 {
+                            if let Some(sel) = state.selected {
+                                if sel < state.filtered_indices.len() {
+                                    let win_idx = state.filtered_indices[sel];
+                                    let target_hwnd = state.windows[win_idx].hwnd;
+                                    let _ = ShowWindow(hwnd, SW_HIDE);
+                                    state.visible = false;
+                                    let _ = SetForegroundWindow(target_hwnd);
+                                }
+                            }
+                        } else if vk == VK_TAB.0 || vk == VK_RIGHT.0 {
+                            let count = state.filtered_indices.len();
+                            if count > 0 {
+                                let idx = match state.selected {
+                                    Some(s) if s + 1 < count => s + 1,
+                                    Some(_) => 0,
+                                    None => 0,
+                                };
+                                select_and_navigate(state, Some(idx), ctrl_held());
+                                let _ = InvalidateRect(Some(hwnd), None, false);
+                            }
+                        } else if vk == VK_LEFT.0 {
+                            let count = state.filtered_indices.len();
+                            if count > 0 {
+                                let idx = match state.selected {
+                                    Some(0) => count - 1,
+                                    Some(s) => s - 1,
+                                    None => 0,
+                                };
+                                select_and_navigate(state, Some(idx), ctrl_held());
+                                let _ = InvalidateRect(Some(hwnd), None, false);
+                            }
+                        } else if vk == VK_DOWN.0 {
+                            let count = state.filtered_indices.len();
+                            if count > 0 {
+                                let idx = match state.selected {
+                                    Some(s) => state.canvas.nav_down(s),
+                                    None => 0,
+                                };
+                                select_and_navigate(state, Some(idx), ctrl_held());
+                                let _ = InvalidateRect(Some(hwnd), None, false);
+                            }
+                        } else if vk == VK_UP.0 {
+                            let count = state.filtered_indices.len();
+                            if count > 0 {
+                                let idx = match state.selected {
+                                    Some(s) => state.canvas.nav_up(s),
+                                    None => 0,
+                                };
+                                select_and_navigate(state, Some(idx), ctrl_held());
+                                let _ = InvalidateRect(Some(hwnd), None, false);
+                            }
+                        } else if vk >= 0x31 && vk <= 0x39 && !state.search.is_active() {
+                            let num = (vk - 0x30) as usize;
+                            let idx = num - 1;
+                            if idx < state.filtered_indices.len() {
+                                let win_idx = state.filtered_indices[idx];
                                 let target_hwnd = state.windows[win_idx].hwnd;
                                 let _ = ShowWindow(hwnd, SW_HIDE);
                                 state.visible = false;
@@ -630,103 +861,50 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                     }
                 });
-            } else if vk == VK_TAB.0 || vk == VK_RIGHT.0 {
-                APP.with(|app| {
-                    if let Some(ref mut state) = *app.borrow_mut() {
-                        let count = state.filtered_indices.len();
-                        if count > 0 {
-                            let idx = match state.selected {
-                                Some(s) if s + 1 < count => s + 1,
-                                Some(_) => 0,
-                                None => 0,
-                            };
-                            select_and_navigate(state, Some(idx), ctrl_held());
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                        }
-                    }
-                });
-            } else if vk == VK_LEFT.0 {
-                APP.with(|app| {
-                    if let Some(ref mut state) = *app.borrow_mut() {
-                        let count = state.filtered_indices.len();
-                        if count > 0 {
-                            let idx = match state.selected {
-                                Some(0) => count - 1,
-                                Some(s) => s - 1,
-                                None => 0,
-                            };
-                            select_and_navigate(state, Some(idx), ctrl_held());
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                        }
-                    }
-                });
-            } else if vk == VK_DOWN.0 {
-                APP.with(|app| {
-                    if let Some(ref mut state) = *app.borrow_mut() {
-                        let count = state.filtered_indices.len();
-                        if count > 0 {
-                            let idx = match state.selected {
-                                Some(s) => state.canvas.nav_down(s),
-                                None => 0,
-                            };
-                            select_and_navigate(state, Some(idx), ctrl_held());
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                        }
-                    }
-                });
-            } else if vk == VK_UP.0 {
-                APP.with(|app| {
-                    if let Some(ref mut state) = *app.borrow_mut() {
-                        let count = state.filtered_indices.len();
-                        if count > 0 {
-                            let idx = match state.selected {
-                                Some(s) => state.canvas.nav_up(s),
-                                None => 0,
-                            };
-                            select_and_navigate(state, Some(idx), ctrl_held());
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                        }
-                    }
-                });
-            } else if vk >= 0x31 && vk <= 0x39 && !state_search_active() {
-                // Number keys 1-9: instant switch (only when not searching)
-                let num = (vk - 0x30) as usize;
-                APP.with(|app| {
-                    if let Some(ref mut state) = *app.borrow_mut() {
-                        let idx = num - 1;
-                        if idx < state.filtered_indices.len() {
-                            let win_idx = state.filtered_indices[idx];
-                            let target_hwnd = state.windows[win_idx].hwnd;
-                            let _ = ShowWindow(hwnd, SW_HIDE);
-                            state.visible = false;
-                            let _ = SetForegroundWindow(target_hwnd);
-                        }
-                    }
-                });
             }
             LRESULT(0)
         }
 
         WM_HOTKEY => {
-            if wparam.0 as i32 == HOTKEY_ID {
-                APP.with(|app| {
-                    if let Some(ref mut state) = *app.borrow_mut() {
-                        if state.visible {
-                            let _ = ShowWindow(hwnd, SW_HIDE);
-                            state.visible = false;
-                        } else {
-                            let _ = ShowWindow(hwnd, SW_SHOW);
-                            let _ = SetForegroundWindow(hwnd);
-                            state.visible = true;
-                            state.selected = None;
-                            state.hovered = None;
-                            state.search.clear();
-                            refresh_windows(state);
+            let id = wparam.0 as i32;
+            APP.with(|app| {
+                if let Some(ref mut state) = *app.borrow_mut() {
+                    match id {
+                        HOTKEY_ID => {
+                            // Ctrl+Space: toggle overlay visibility
+                            if state.visible {
+                                exit_pin_focus(state);
+                                let _ = ShowWindow(hwnd, SW_HIDE);
+                                state.visible = false;
+                            } else {
+                                let _ = ShowWindow(hwnd, SW_SHOW);
+                                let _ = SetForegroundWindow(hwnd);
+                                state.visible = true;
+                                state.selected = None;
+                                state.hovered = None;
+                                state.pin_mode = false;
+                                state.search.clear();
+                                refresh_windows(state);
+                                let _ = InvalidateRect(Some(hwnd), None, false);
+                            }
+                        }
+                        PIN_F1_HOTKEY_ID | PIN_ESC_HOTKEY_ID => {
+                            // F1 or Escape while pin-focused: exit pin focus
+                            exit_pin_focus(state);
+                            if id == PIN_ESC_HOTKEY_ID {
+                                state.pin_mode = false;
+                            }
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
+                        _ => {}
                     }
-                });
-            }
+                }
+            });
+            LRESULT(0)
+        }
+
+        WM_KEYUP => {
+            // Keyboard goes to target via SetForegroundWindow during pin focus
             LRESULT(0)
         }
 
@@ -734,7 +912,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if wparam.0 == TIMER_ID {
                 APP.with(|app| {
                     if let Some(ref mut state) = *app.borrow_mut() {
-                        if state.visible {
+                        if state.pin_focus.is_some() {
+                            // Don't refresh while pin-focused (it destroys all thumbnails).
+                            // Just validate the target is still alive.
+                            let dead = {
+                                let f = state.pin_focus.as_ref().unwrap();
+                                !IsWindow(Some(f.target_hwnd)).as_bool()
+                            };
+                            if dead {
+                                exit_pin_focus(state);
+                                let _ = InvalidateRect(Some(hwnd), None, false);
+                            }
+                        } else if state.visible {
                             refresh_windows(state);
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
@@ -795,6 +984,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             });
             LRESULT(0)
+        }
+
+        WM_NCHITTEST => {
+            // Pin focus: return HTTRANSPARENT over the focused thumbnail region
+            // so real hardware clicks pass through to the target window behind.
+            let transparent = APP.with(|app| {
+                let state = app.borrow();
+                if let Some(ref state) = *state {
+                    if let Some(ref focus) = state.pin_focus {
+                        let x = (lparam.0 & 0xFFFF) as i16 as i32;
+                        let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                        let tr = state.canvas.thumb_rect(focus.grid_idx);
+                        if x >= tr.left && x < tr.right && y >= tr.top && y < tr.bottom {
+                            return true;
+                        }
+                    }
+                }
+                false
+            });
+            if transparent {
+                return LRESULT(-1); // HTTRANSPARENT
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
 
         WM_DESTROY => {

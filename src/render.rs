@@ -32,6 +32,7 @@ pub struct RenderContext {
     pub hover_brush: ID2D1SolidColorBrush,
     pub badge_brush: ID2D1SolidColorBrush,
     pub badge_text_brush: ID2D1SolidColorBrush,
+    pub pin_brush: ID2D1SolidColorBrush,
     pub badge_format: IDWriteTextFormat,
     pub dwrite_factory: IDWriteFactory,
     pub title_format: IDWriteTextFormat,
@@ -104,6 +105,10 @@ impl RenderContext {
                 .CreateSolidColorBrush(&color(0.0, 0.0, 0.0, 1.0), None)
                 .unwrap();
 
+            let pin_brush = target
+                .CreateSolidColorBrush(&color(1.0, 0.6, 0.0, 1.0), None)
+                .unwrap();
+
             let dwrite_factory: IDWriteFactory =
                 DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap();
 
@@ -166,6 +171,7 @@ impl RenderContext {
                 hover_brush,
                 badge_brush,
                 badge_text_brush,
+                pin_brush,
                 dwrite_factory,
                 title_format,
                 search_format,
@@ -340,6 +346,54 @@ impl RenderContext {
             };
             self.target
                 .DrawRoundedRectangle(&rounded, &self.selection_brush, 2.5, None);
+        }
+    }
+
+    pub fn draw_pin_focus_border(&self, rect: RECT) {
+        unsafe {
+            let d2d_rect = D2D_RECT_F {
+                left: rect.left as f32 - 3.0,
+                top: rect.top as f32 - 3.0,
+                right: rect.right as f32 + 3.0,
+                bottom: rect.bottom as f32 + 3.0,
+            };
+            let rounded = D2D1_ROUNDED_RECT {
+                rect: d2d_rect,
+                radiusX: CORNER_RADIUS,
+                radiusY: CORNER_RADIUS,
+            };
+            self.target
+                .DrawRoundedRectangle(&rounded, &self.pin_brush, 3.0, None);
+        }
+    }
+
+    pub fn draw_pin_button(&self, rect: RECT, active: bool) {
+        unsafe {
+            let d2d_rect = D2D_RECT_F {
+                left: rect.left as f32,
+                top: rect.top as f32,
+                right: rect.right as f32,
+                bottom: rect.bottom as f32,
+            };
+            let rounded = D2D1_ROUNDED_RECT {
+                rect: d2d_rect,
+                radiusX: 6.0,
+                radiusY: 6.0,
+            };
+            let brush = if active { &self.pin_brush } else { &self.highlight_brush };
+            self.target.FillRoundedRectangle(&rounded, brush);
+            self.target.DrawRoundedRectangle(&rounded, &self.pin_brush, 1.0, None);
+
+            let text: Vec<u16> = "PIN".encode_utf16().collect();
+            let text_brush = if active { &self.badge_text_brush } else { &self.text_brush };
+            self.target.DrawText(
+                &text,
+                &self.badge_format,
+                &d2d_rect,
+                text_brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE(0),
+            );
         }
     }
 }
