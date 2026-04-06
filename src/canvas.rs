@@ -28,8 +28,12 @@ pub struct PanAnimation {
     pub active: bool,
 }
 
-fn ease_out_cubic(t: f64) -> f64 {
-    1.0 - (1.0 - t).powi(3)
+/// Critically damped spring response curve.
+/// Settles smoothly without overshoot; feels like macOS/iOS animations.
+/// omega controls snappiness (higher = faster settle).
+fn spring_ease(t: f64) -> f64 {
+    let omega = 6.0;
+    1.0 - (1.0 + omega * t) * (-omega * t).exp()
 }
 
 pub struct CanvasState {
@@ -43,6 +47,11 @@ pub struct CanvasState {
     pub last_mouse_y: i32,
     pub anim: PanAnimation,
     pub layout: Vec<CellLayout>,
+    // Inertial panning state
+    pub velocity_x: f64,
+    pub velocity_y: f64,
+    pub last_pan_ticks: i64,
+    pub inertia_active: bool,
 }
 
 impl CanvasState {
@@ -68,6 +77,10 @@ impl CanvasState {
                 active: false,
             },
             layout: Vec::new(),
+            velocity_x: 0.0,
+            velocity_y: 0.0,
+            last_pan_ticks: 0,
+            inertia_active: false,
         }
     }
 
@@ -222,18 +235,90 @@ impl CanvasState {
         }
     }
 
-    pub fn zoom_at(&mut self, mx: i32, my: i32, delta: i16) {
-        let old_zoom = self.zoom;
-        let factor = if delta > 0 { 1.1 } else { 1.0 / 1.1 };
-        self.zoom = (self.zoom * factor).clamp(0.1, 5.0);
-        let ratio = self.zoom / old_zoom;
-        self.pan_x = mx as f64 - ratio * (mx as f64 - self.pan_x);
-        self.pan_y = my as f64 - ratio * (my as f64 - self.pan_y);
+    /// Animated scroll-wheel zoom toward cursor. Retargetable mid-flight.
+    pub fn zoom_at_animated(&mut self, mx: i32, my: i32, delta: i16, freq: i64, now: i64) {
+        // Resolve current animation state if mid-flight
+        if self.anim.active {
+            self.tick_animation(now);
+        }
+        let factor = if delta > 0 { 1.12 } else { 1.0 / 1.12 };
+        let target_zoom = (self.zoom * factor).clamp(0.1, 5.0);
+        let ratio = target_zoom / self.zoom;
+        let target_pan_x = mx as f64 - ratio * (mx as f64 - self.pan_x);
+        let target_pan_y = my as f64 - ratio * (my as f64 - self.pan_y);
+        self.anim = PanAnimation {
+            start_x: self.pan_x,
+            start_y: self.pan_y,
+            target_x: target_pan_x,
+            target_y: target_pan_y,
+            start_zoom: self.zoom,
+            target_zoom,
+            start_ticks: now,
+            duration_ticks: freq * 150 / 1000, // 150ms -- snappy for scroll
+            active: true,
+        };
     }
 
-    pub fn pan(&mut self, dx: i32, dy: i32) {
+    /// Pan with velocity tracking for inertia on release.
+    pub fn pan_with_velocity(&mut self, dx: i32, dy: i32, freq: i64, now: i64) {
         self.pan_x += dx as f64;
         self.pan_y += dy as f64;
+        let dt = (now - self.last_pan_ticks) as f64 / freq as f64;
+        if dt > 0.001 && dt < 0.1 {
+            let vx = dx as f64 / dt;
+            let vy = dy as f64 / dt;
+            // Exponential smoothing -- dampens jitter from irregular mouse events
+            self.velocity_x = 0.6 * self.velocity_x + 0.4 * vx;
+            self.velocity_y = 0.6 * self.velocity_y + 0.4 * vy;
+        }
+        self.last_pan_ticks = now;
+    }
+
+    /// Begin inertial coast after releasing pan. Returns true if inertia started.
+    pub fn start_inertia(&mut self, now: i64) -> bool {
+        let speed = (self.velocity_x * self.velocity_x + self.velocity_y * self.velocity_y).sqrt();
+        if speed > 100.0 {
+            self.inertia_active = true;
+            self.last_pan_ticks = now;
+            true
+        } else {
+            self.velocity_x = 0.0;
+            self.velocity_y = 0.0;
+            false
+        }
+    }
+
+    /// Stop inertia (e.g. user clicked or started new pan).
+    pub fn stop_inertia(&mut self) {
+        self.inertia_active = false;
+        self.velocity_x = 0.0;
+        self.velocity_y = 0.0;
+    }
+
+    /// Tick inertial panning. Returns true if still coasting.
+    pub fn tick_inertia(&mut self, now: i64, freq: i64) -> bool {
+        if !self.inertia_active {
+            return false;
+        }
+        let dt = (now - self.last_pan_ticks) as f64 / freq as f64;
+        if dt <= 0.0 || dt > 0.1 {
+            self.last_pan_ticks = now;
+            return self.inertia_active;
+        }
+        self.last_pan_ticks = now;
+        let friction = 5.0;
+        let decay = (-friction * dt).exp();
+        self.velocity_x *= decay;
+        self.velocity_y *= decay;
+        self.pan_x += self.velocity_x * dt;
+        self.pan_y += self.velocity_y * dt;
+        let speed = (self.velocity_x * self.velocity_x + self.velocity_y * self.velocity_y).sqrt();
+        if speed < 15.0 {
+            self.inertia_active = false;
+            self.velocity_x = 0.0;
+            self.velocity_y = 0.0;
+        }
+        self.inertia_active
     }
 
     pub fn center_on(&mut self, index: usize, freq: i64, now: i64) {
@@ -396,7 +481,7 @@ impl CanvasState {
             start_zoom: self.zoom,
             target_zoom: self.zoom,
             start_ticks: now,
-            duration_ticks: freq * 200 / 1000, // 200ms
+            duration_ticks: freq * 280 / 1000, // 280ms
             active: true,
         };
     }
@@ -410,7 +495,7 @@ impl CanvasState {
             start_zoom: self.zoom,
             target_zoom,
             start_ticks: now,
-            duration_ticks: freq * 300 / 1000, // 300ms
+            duration_ticks: freq * 350 / 1000, // 350ms
             active: true,
         };
     }
@@ -447,10 +532,16 @@ impl CanvasState {
             return true;
         }
         let t = elapsed as f64 / self.anim.duration_ticks as f64;
-        let e = ease_out_cubic(t);
+        let e = spring_ease(t);
         self.pan_x = self.anim.start_x + (self.anim.target_x - self.anim.start_x) * e;
         self.pan_y = self.anim.start_y + (self.anim.target_y - self.anim.start_y) * e;
-        self.zoom = self.anim.start_zoom + (self.anim.target_zoom - self.anim.start_zoom) * e;
+        // Exponential zoom interpolation -- feels uniform because zoom is multiplicative
+        if self.anim.start_zoom > 0.0 && self.anim.target_zoom > 0.0 {
+            let ratio = self.anim.target_zoom / self.anim.start_zoom;
+            self.zoom = self.anim.start_zoom * ratio.powf(e);
+        } else {
+            self.zoom = self.anim.start_zoom + (self.anim.target_zoom - self.anim.start_zoom) * e;
+        }
         true
     }
 }

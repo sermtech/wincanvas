@@ -727,9 +727,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         return;
                     }
                     let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
-                    state.canvas.anim.active = false;
-                    let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
-                    state.canvas.zoom_at(mx, my, delta);
+                    let mut now: i64 = 0;
+                    let _ = QueryPerformanceCounter(&mut now);
+                    state.canvas.stop_inertia();
+                    state.canvas.zoom_at_animated(mx, my, delta, state.qpc_freq, now);
+                    let _ = SetTimer(Some(hwnd), ANIM_TIMER_ID, ANIM_INTERVAL_MS, None);
                     update_all_thumbnails(state);
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
@@ -748,6 +750,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     if state.pin_focus.is_none() {
                         state.canvas.anim.active = false;
+                        state.canvas.stop_inertia();
                         let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
                     }
                     state.canvas.is_panning = true;
@@ -775,6 +778,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let win_idx = state.filtered_indices[grid_idx];
                             show_context_menu(hwnd, mx, my, win_idx, state);
                         }
+                        state.canvas.stop_inertia();
+                    } else if state.did_pan && state.pin_focus.is_none() {
+                        // Start inertial coast
+                        let mut now: i64 = 0;
+                        let _ = QueryPerformanceCounter(&mut now);
+                        if state.canvas.start_inertia(now) {
+                            let _ = SetTimer(Some(hwnd), ANIM_TIMER_ID, ANIM_INTERVAL_MS, None);
+                        }
                     }
                     state.right_click_start = None;
                 }
@@ -793,7 +804,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         if dx.abs() > 3 || dy.abs() > 3 {
                             state.did_pan = true;
                         }
-                        state.canvas.pan(dx, dy);
+                        let mut now: i64 = 0;
+                        let _ = QueryPerformanceCounter(&mut now);
+                        state.canvas.pan_with_velocity(dx, dy, state.qpc_freq, now);
                         state.canvas.last_mouse_x = mx;
                         state.canvas.last_mouse_y = my;
                         update_all_thumbnails(state);
@@ -1179,10 +1192,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if let Some(ref mut state) = *app.borrow_mut() {
                         let mut now: i64 = 0;
                         let _ = QueryPerformanceCounter(&mut now);
-                        let still_going = state.canvas.tick_animation(now);
+                        let anim_going = state.canvas.tick_animation(now);
+                        let inertia_going = state.canvas.tick_inertia(now, state.qpc_freq);
                         update_all_thumbnails(state);
                         let _ = InvalidateRect(Some(hwnd), None, false);
-                        if !still_going {
+                        if !anim_going && !inertia_going {
                             let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
                             // Zoom-in animation completed: position window and punch hole
                             if state.pin_zoom_pending {
