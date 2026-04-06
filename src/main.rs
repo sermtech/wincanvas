@@ -16,7 +16,10 @@ use thumbnails::{
 use std::cell::RefCell;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::Graphics::Gdi::{ClientToScreen, InvalidateRect, ValidateRect};
+use windows::Win32::Graphics::Gdi::{
+    ClientToScreen, CombineRgn, CreateRectRgn, DeleteObject, InvalidateRect, SetWindowRgn,
+    ValidateRect, RGN_DIFF,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -355,6 +358,27 @@ fn compute_client_aligned_rect(hwnd: HWND, client_target: &RECT) -> (i32, i32, i
     }
 }
 
+/// Punch a rectangular hole in the overlay's window region so clicks reach the window behind.
+fn apply_region_hole(hwnd: HWND, hole: &RECT) {
+    unsafe {
+        let sw = GetSystemMetrics(SM_CXSCREEN);
+        let sh = GetSystemMetrics(SM_CYSCREEN);
+        let full = CreateRectRgn(0, 0, sw, sh);
+        let cut = CreateRectRgn(hole.left, hole.top, hole.right, hole.bottom);
+        CombineRgn(Some(full), Some(full), Some(cut), RGN_DIFF);
+        SetWindowRgn(hwnd, Some(full), true);
+        // SetWindowRgn takes ownership of `full`; only delete `cut`
+        let _ = DeleteObject(cut.into());
+    }
+}
+
+/// Remove the window region, restoring the full overlay surface.
+fn clear_region_hole(hwnd: HWND) {
+    unsafe {
+        SetWindowRgn(hwnd, None, true);
+    }
+}
+
 fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
     // Exit any existing pin focus first
     exit_pin_focus(state);
@@ -393,7 +417,7 @@ fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
     unsafe {
         let _ = SetWindowPos(
             target, Some(HWND_TOP), px, py, pw, ph,
-            SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS | SWP_FRAMECHANGED,
+            SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
 
         // Give keyboard focus to target
@@ -402,6 +426,15 @@ fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
         // Register F1 and Escape as global hotkeys for exiting pin focus
         let _ = RegisterHotKey(Some(state.hwnd), PIN_F1_HOTKEY_ID, MOD_NOREPEAT, VK_F1.0 as u32);
         let _ = RegisterHotKey(Some(state.hwnd), PIN_ESC_HOTKEY_ID, MOD_NOREPEAT, VK_ESCAPE.0 as u32);
+    }
+
+    // Punch a hole in the overlay so clicks reach the real window
+    apply_region_hole(state.hwnd, &tr);
+
+    // Hide DWM thumbnail for the focused window -- real window visible through hole
+    if let Some(thumb) = state.windows[win_idx].thumbnail {
+        let hide = RECT { left: -1, top: -1, right: -1, bottom: -1 };
+        update_thumbnail(thumb, hide, 0, 0, 0);
     }
 
     state.pin_focus = Some(PinFocusState {
@@ -414,6 +447,8 @@ fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
 
 fn exit_pin_focus(state: &mut AppState) {
     if let Some(focus) = state.pin_focus.take() {
+        // Remove the region hole, restoring full overlay
+        clear_region_hole(state.hwnd);
         unsafe {
             // Restore original position/size
             if IsWindow(Some(focus.target_hwnd)).as_bool() {
@@ -528,7 +563,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             APP.with(|app| {
                 if let Some(ref mut state) = *app.borrow_mut() {
-                    // Pin focus active: ignore (right-clicks pass through via HTTRANSPARENT)
+                    // Pin focus active: ignore (right-clicks pass through the region hole)
                     if state.pin_focus.is_some() {
                         return;
                     }
@@ -583,7 +618,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         update_all_thumbnails(state);
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     } else if state.pin_focus.is_some() {
-                        // Pin focus active: mouse moves pass through via HTTRANSPARENT
+                        // Pin focus active: mouse moves pass through the region hole
                     } else if state.drag.is_some() {
                         let drag = state.drag.as_mut().unwrap();
                         if !drag.active {
@@ -652,7 +687,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
                     if state.pin_mode {
                         // Clicks on focused window's thumb_rect never reach here
-                        // (HTTRANSPARENT passes them to the real window).
+                        // (clicks pass through the region hole to the real window).
                         // Clicks outside go here -- focus a new window or unfocus.
                         if let Some(grid_idx) = state.canvas.hit_test(mx, my, count) {
                             let already_focused = state.pin_focus.as_ref().map(|f| f.grid_idx) == Some(grid_idx);
@@ -698,7 +733,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             APP.with(|app| {
                 if let Some(ref mut state) = *app.borrow_mut() {
-                    // Pin focus: clicks pass through via HTTRANSPARENT
+                    // Pin focus: clicks pass through the region hole
                     if state.pin_focus.is_some() {
                         return;
                     }
@@ -992,32 +1027,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             });
             LRESULT(0)
-        }
-
-        WM_NCHITTEST => {
-            // Pin focus: return HTTRANSPARENT over the focused thumbnail region
-            // so real hardware clicks pass through to the target window behind.
-            let transparent = APP.with(|app| {
-                let state = app.borrow();
-                if let Some(ref state) = *state {
-                    if let Some(ref focus) = state.pin_focus {
-                        if focus.grid_idx >= state.canvas.layout.len() {
-                            return false;
-                        }
-                        let x = (lparam.0 & 0xFFFF) as i16 as i32;
-                        let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-                        let tr = state.canvas.thumb_rect(focus.grid_idx);
-                        if x >= tr.left && x < tr.right && y >= tr.top && y < tr.bottom {
-                            return true;
-                        }
-                    }
-                }
-                false
-            });
-            if transparent {
-                return LRESULT(-1); // HTTRANSPARENT
-            }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
 
         WM_DESTROY => {
