@@ -76,6 +76,7 @@ struct AppState {
     visible: bool,
     qpc_freq: i64,
     vdm: Option<IVirtualDesktopManager>,
+    last_desktop_id: Option<windows::core::GUID>,
 }
 
 thread_local! {
@@ -169,6 +170,7 @@ fn main() {
             vdm: windows::Win32::System::Com::CoCreateInstance(
                 &VirtualDesktopManager, None, windows::Win32::System::Com::CLSCTX_ALL,
             ).ok(),
+            last_desktop_id: None,
         };
 
         refresh_windows(&mut state);
@@ -473,7 +475,12 @@ fn update_pin_position(state: &mut AppState) {
 /// Get the current virtual desktop GUID by probing non-cloaked windows from our list.
 /// Shell_TrayWnd is pinned to ALL desktops so GetWindowDesktopId returns "Element not found".
 /// Instead, find a regular non-cloaked window and query its desktop GUID.
-fn get_current_desktop_id(vdm: &IVirtualDesktopManager, windows: &[WindowInfo]) -> Option<windows::core::GUID> {
+/// Falls back to `cached` (last known GUID) when all windows are cloaked (e.g. empty desktop).
+fn get_current_desktop_id(
+    vdm: &IVirtualDesktopManager,
+    windows: &[WindowInfo],
+    cached: &mut Option<windows::core::GUID>,
+) -> Option<windows::core::GUID> {
     unsafe {
         // Try non-cloaked windows from our enumerated list
         for w in windows {
@@ -484,8 +491,8 @@ fn get_current_desktop_id(vdm: &IVirtualDesktopManager, windows: &[WindowInfo]) 
             match vdm.IsWindowOnCurrentVirtualDesktop(w.hwnd) {
                 Ok(on_current) if on_current.as_bool() => {
                     if let Ok(guid) = vdm.GetWindowDesktopId(w.hwnd) {
-                        // GUID_NULL means the window isn't assigned (pinned / special)
                         if guid != windows::core::GUID::zeroed() {
+                            *cached = Some(guid);
                             return Some(guid);
                         }
                     }
@@ -500,20 +507,22 @@ fn get_current_desktop_id(vdm: &IVirtualDesktopManager, windows: &[WindowInfo]) 
             }
             if let Ok(guid) = vdm.GetWindowDesktopId(w.hwnd) {
                 if guid != windows::core::GUID::zeroed() {
+                    *cached = Some(guid);
                     return Some(guid);
                 }
             }
         }
-        None
+        // All windows cloaked or no windows -- use last known desktop
+        *cached
     }
 }
 
 /// Move the canvas to whichever virtual desktop the user is currently on.
-fn ensure_canvas_on_current_desktop(state: &AppState) {
+fn ensure_canvas_on_current_desktop(state: &mut AppState) {
     if let Some(ref vdm) = state.vdm {
-        if let Some(desktop_id) = get_current_desktop_id(vdm, &state.windows) {
+        if let Some(id) = get_current_desktop_id(vdm, &state.windows, &mut state.last_desktop_id) {
             unsafe {
-                let _ = vdm.MoveWindowToDesktop(state.hwnd, &desktop_id);
+                let _ = vdm.MoveWindowToDesktop(state.hwnd, &id);
             }
         }
     }
@@ -522,6 +531,10 @@ fn ensure_canvas_on_current_desktop(state: &AppState) {
 fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
     // Exit any existing pin focus first (clears hole and animates back if needed)
     exit_pin_focus(state);
+
+    // Cancel any in-flight animation or inertia so they don't fight the zoom-in
+    state.canvas.stop_inertia();
+    state.canvas.anim.active = false;
 
     let win_idx = state.filtered_indices[grid_idx];
     let target = state.windows[win_idx].hwnd;
@@ -538,7 +551,7 @@ fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
     // For cloaked (cross-desktop) windows: move target to our desktop so it uncloaks
     if is_cloaked {
         if let Some(ref vdm) = state.vdm {
-            if let Some(our_desktop) = get_current_desktop_id(vdm, &state.windows) {
+            if let Some(our_desktop) = get_current_desktop_id(vdm, &state.windows, &mut state.last_desktop_id) {
                 let move_ok = unsafe { vdm.MoveWindowToDesktop(target, &our_desktop) };
                 if move_ok.is_ok() {
                     state.windows[win_idx].cloaked = false;
@@ -915,7 +928,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let is_cloaked = state.windows[win_idx].cloaked;
                             if is_cloaked {
                                 if let Some(ref vdm) = state.vdm {
-                                    if let Some(our_desktop) = get_current_desktop_id(vdm, &state.windows) {
+                                    if let Some(our_desktop) = get_current_desktop_id(vdm, &state.windows, &mut state.last_desktop_id) {
                                         let _ = unsafe { vdm.MoveWindowToDesktop(target_hwnd, &our_desktop) };
                                     }
                                 }
@@ -1046,7 +1059,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                     let target_hwnd = state.windows[win_idx].hwnd;
                                     if state.windows[win_idx].cloaked {
                                         if let Some(ref vdm) = state.vdm {
-                                            if let Some(our_desktop) = get_current_desktop_id(vdm, &state.windows) {
+                                            if let Some(our_desktop) = get_current_desktop_id(vdm, &state.windows, &mut state.last_desktop_id) {
                                                 let _ = unsafe { vdm.MoveWindowToDesktop(target_hwnd, &our_desktop) };
                                             }
                                         }
@@ -1106,7 +1119,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 let target_hwnd = state.windows[win_idx].hwnd;
                                 if state.windows[win_idx].cloaked {
                                     if let Some(ref vdm) = state.vdm {
-                                        if let Some(our_desktop) = get_current_desktop_id(vdm, &state.windows) {
+                                        if let Some(our_desktop) = get_current_desktop_id(vdm, &state.windows, &mut state.last_desktop_id) {
                                             let _ = unsafe { vdm.MoveWindowToDesktop(target_hwnd, &our_desktop) };
                                         }
                                     }
@@ -1196,13 +1209,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let inertia_going = state.canvas.tick_inertia(now, state.qpc_freq);
                         update_all_thumbnails(state);
                         let _ = InvalidateRect(Some(hwnd), None, false);
+                        // Pin hole fires when zoom animation ends, independent of inertia
+                        if !anim_going && state.pin_zoom_pending {
+                            state.pin_zoom_pending = false;
+                            apply_pin_hole(state);
+                        }
                         if !anim_going && !inertia_going {
                             let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
-                            // Zoom-in animation completed: position window and punch hole
-                            if state.pin_zoom_pending {
-                                state.pin_zoom_pending = false;
-                                apply_pin_hole(state);
-                            }
                         }
                     }
                 });
