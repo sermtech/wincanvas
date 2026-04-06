@@ -389,6 +389,21 @@ fn apply_pin_hole(state: &mut AppState) {
     if let Some(ref focus) = state.pin_focus {
         let grid_idx = focus.grid_idx;
         let target = focus.target_hwnd;
+
+        // Guard: target may have been closed during the animation
+        if !unsafe { IsWindow(Some(target)).as_bool() } {
+            let hwnd = state.hwnd;
+            state.pin_focus = None;
+            clear_region_hole(hwnd);
+            update_all_thumbnails(state);
+            return;
+        }
+
+        // Guard: layout may have changed (belt-and-suspenders)
+        if grid_idx >= state.canvas.layout.len() || grid_idx >= state.filtered_indices.len() {
+            return;
+        }
+
         let tr = state.canvas.thumb_rect(grid_idx);
         unsafe {
             let (px, py, pw, ph) = compute_client_aligned_rect(target, &tr);
@@ -440,9 +455,15 @@ fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
         let _ = RegisterHotKey(Some(state.hwnd), PIN_ESC_HOTKEY_ID, MOD_NOREPEAT, VK_ESCAPE.0 as u32);
     }
 
-    // Calculate target zoom+pan to center this cell at the window's original client size
-    let client_w = state.windows[win_idx].client_w;
-    let client_h = state.windows[win_idx].client_h;
+    // Calculate target zoom+pan to center this cell at the window's original client size.
+    // Use source dimensions as fallback if client dimensions are unavailable (e.g. minimized).
+    let w = &state.windows[win_idx];
+    let client_w = if w.client_w > 0 { w.client_w } else { w.source_w };
+    let client_h = if w.client_h > 0 { w.client_h } else { w.source_h };
+    if client_w <= 0 || client_h <= 0 {
+        // No valid size available; cannot compute zoom target -- abort
+        return;
+    }
     let (target_zoom, target_pan_x, target_pan_y) =
         state.canvas.calc_pin_target(grid_idx, client_w, client_h);
 
@@ -610,7 +631,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             APP.with(|app| {
                 if let Some(ref mut state) = *app.borrow_mut() {
-                    if state.pin_focus.is_some() {
+                    if state.pin_focus.is_some() || state.pin_zoom_pending {
                         return;
                     }
                     state.canvas.is_panning = false;
