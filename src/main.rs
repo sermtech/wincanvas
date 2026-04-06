@@ -13,7 +13,7 @@ use thumbnails::{
     WindowInfo,
 };
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::Write;
 use windows::core::PCWSTR;
 
@@ -45,6 +45,8 @@ const PIN_ESC_HOTKEY_ID: i32 = 3;
 const TIMER_ID: usize = 1;
 /// Custom message: deferred desktop switch (COM calls pump messages, can't call inside RefCell borrow)
 const WM_DEFERRED_DESKTOP: u32 = WM_APP;
+/// Custom message: deferred pin-focus desktop switch for cloaked windows
+const WM_DEFERRED_PIN_ENTER: u32 = WM_APP + 1;
 const ANIM_TIMER_ID: usize = 2;
 const ANIM_INTERVAL_MS: u32 = 16;
 
@@ -95,6 +97,9 @@ struct AppState {
 
 thread_local! {
     static APP: RefCell<Option<AppState>> = RefCell::new(None);
+    /// Guard: set true around VDM COM calls inside RefCell borrows.
+    /// When true, wndproc skips to DefWindowProcW to prevent re-entrant borrow panics.
+    static IN_COM_CALL: Cell<bool> = Cell::new(false);
 }
 
 fn main() {
@@ -538,13 +543,47 @@ fn get_current_desktop_id(
     }
 }
 
+/// Get current desktop GUID by probing HWNDs (for use outside RefCell borrow).
+fn get_current_desktop_id_from_hwnds(
+    vdm: &IVirtualDesktopManager,
+    hwnds: &[HWND],
+    cached: Option<windows::core::GUID>,
+) -> Option<windows::core::GUID> {
+    unsafe {
+        for &h in hwnds {
+            match vdm.IsWindowOnCurrentVirtualDesktop(h) {
+                Ok(on_current) if on_current.as_bool() => {
+                    if let Ok(guid) = vdm.GetWindowDesktopId(h) {
+                        if guid != windows::core::GUID::zeroed() {
+                            return Some(guid);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for &h in hwnds {
+            if let Ok(guid) = vdm.GetWindowDesktopId(h) {
+                if guid != windows::core::GUID::zeroed() {
+                    return Some(guid);
+                }
+            }
+        }
+        cached
+    }
+}
+
 /// Move the canvas to whichever virtual desktop the user is currently on.
+/// COM calls are wrapped in IN_COM_CALL guard to prevent re-entrant borrow panics.
 fn ensure_canvas_on_current_desktop(state: &mut AppState) {
     if let Some(ref vdm) = state.vdm {
-        if let Some(id) = get_current_desktop_id(vdm, &state.windows, &mut state.last_desktop_id) {
-            unsafe {
-                let _ = vdm.MoveWindowToDesktop(state.hwnd, &id);
-            }
+        IN_COM_CALL.with(|c| c.set(true));
+        let id = get_current_desktop_id(vdm, &state.windows, &mut state.last_desktop_id);
+        IN_COM_CALL.with(|c| c.set(false));
+        if let Some(id) = id {
+            IN_COM_CALL.with(|c| c.set(true));
+            unsafe { let _ = vdm.MoveWindowToDesktop(state.hwnd, &id); }
+            IN_COM_CALL.with(|c| c.set(false));
         }
     }
 }
@@ -557,7 +596,10 @@ fn ensure_canvas_on_current_desktop(state: &mut AppState) {
 fn activate_cross_desktop(state: &mut AppState, target: HWND) {
     dbg_log(&format!("activate_cross_desktop: target={:?}", target));
     if let Some(ref vdm) = state.vdm {
-        if let Ok(target_desktop) = unsafe { vdm.GetWindowDesktopId(target) } {
+        IN_COM_CALL.with(|c| c.set(true));
+        let result = unsafe { vdm.GetWindowDesktopId(target) };
+        IN_COM_CALL.with(|c| c.set(false));
+        if let Ok(target_desktop) = result {
             state.deferred_desktop = Some(target_desktop);
             unsafe {
                 let _ = PostMessageW(Some(state.hwnd), WM_DEFERRED_DESKTOP, WPARAM(0), LPARAM(0));
@@ -590,58 +632,16 @@ fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
     };
     unsafe { let _ = GetWindowPlacement(target, &mut placement); }
 
-    let mut is_cloaked = state.windows[win_idx].cloaked;
-    let mut saved_desktop: Option<windows::core::GUID> = None;
+    let is_cloaked = state.windows[win_idx].cloaked;
+    let saved_desktop: Option<windows::core::GUID> = None;
 
-    // For cloaked (cross-desktop) windows: try to bring the window to this desktop,
-    // or switch our canvas to the target's desktop if the API denies cross-process moves.
-    if is_cloaked {
-        if let Some(ref vdm) = state.vdm {
-            let our_desktop = get_current_desktop_id(vdm, &state.windows, &mut state.last_desktop_id);
-            let mut uncloaked = false;
-
-            // Plan A: move target to our desktop (works for own-process windows)
-            if let Some(our_id) = our_desktop {
-                if unsafe { vdm.MoveWindowToDesktop(target, &our_id) }.is_ok() {
-                    uncloaked = true;
-                }
-            }
-
-            // Plan B: move our canvas to target's desktop (own-process, always works)
-            if !uncloaked {
-                if let Ok(target_desktop) = unsafe { vdm.GetWindowDesktopId(target) } {
-                    if unsafe { vdm.MoveWindowToDesktop(state.hwnd, &target_desktop) }.is_ok() {
-                        // Reclaim topmost + foreground to trigger desktop switch
-                        unsafe {
-                            let _ = SetWindowPos(state.hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0,
-                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                            let _ = SetForegroundWindow(state.hwnd);
-                        }
-                        saved_desktop = our_desktop;
-                        uncloaked = true;
-                    }
-                }
-            }
-
-            if uncloaked {
-                state.windows[win_idx].cloaked = false;
-                is_cloaked = false;
-                // Unregister old thumbnail before re-registering
-                if let Some(thumb) = state.windows[win_idx].thumbnail {
-                    unregister_thumbnail(thumb);
-                    state.windows[win_idx].thumbnail = None;
-                }
-                // Re-measure now that window is on our desktop
-                let prev_sw = state.windows[win_idx].source_w;
-                let prev_sh = state.windows[win_idx].source_h;
-                let prev_cw = state.windows[win_idx].client_w;
-                let prev_ch = state.windows[win_idx].client_h;
-                register_and_measure_thumbnail(state.hwnd, &mut state.windows[win_idx]);
-                if state.windows[win_idx].source_w <= 0 { state.windows[win_idx].source_w = prev_sw; }
-                if state.windows[win_idx].source_h <= 0 { state.windows[win_idx].source_h = prev_sh; }
-                if state.windows[win_idx].client_w <= 0 { state.windows[win_idx].client_w = prev_cw; }
-                if state.windows[win_idx].client_h <= 0 { state.windows[win_idx].client_h = prev_ch; }
-            }
+    // For cloaked (cross-desktop) windows: defer COM calls to WM_DEFERRED_PIN_ENTER.
+    // COM calls on STA pump messages, which re-enters wndproc while RefCell is borrowed = panic.
+    // Pin focus is set up below with is_cloaked=true (thumbnail-only preview).
+    // The deferred handler upgrades to full interaction if the desktop switch succeeds.
+    if is_cloaked && state.vdm.is_some() {
+        unsafe {
+            let _ = PostMessageW(Some(state.hwnd), WM_DEFERRED_PIN_ENTER, WPARAM(0), LPARAM(0));
         }
     }
 
@@ -723,6 +723,14 @@ fn exit_pin_focus(state: &mut AppState) {
             // COM calls on STA pump messages -- calling MoveWindowToDesktop here
             // re-enters wndproc while the APP RefCell is still borrowed = panic.
             if let Some(original_desktop) = focus.saved_desktop {
+                // Restore cloaked flag -- the target goes back to its original desktop
+                let grid_idx = focus.grid_idx;
+                if grid_idx < state.filtered_indices.len() {
+                    let win_idx = state.filtered_indices[grid_idx];
+                    if win_idx < state.windows.len() {
+                        state.windows[win_idx].cloaked = true;
+                    }
+                }
                 dbg_log(&format!("  deferring switch back to {:?}", original_desktop));
                 state.deferred_desktop = Some(original_desktop);
                 let _ = PostMessageW(Some(state.hwnd), WM_DEFERRED_DESKTOP, WPARAM(0), LPARAM(0));
@@ -756,6 +764,16 @@ fn clamp_selection(sel: Option<usize>, count: usize) -> Option<usize> {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // Guard: if a VDM COM call is in progress on the STA, this is a re-entrant message pump.
+    // Skip handling to avoid RefCell double-borrow panic.
+    if IN_COM_CALL.with(|c| c.get()) {
+        // Re-post our custom messages so they aren't silently consumed
+        if msg == WM_DEFERRED_DESKTOP || msg == WM_DEFERRED_PIN_ENTER {
+            let _ = PostMessageW(Some(hwnd), msg, wparam, lparam);
+            return LRESULT(0);
+        }
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
     match msg {
         WM_PAINT => {
             APP.with(|app| {
@@ -1359,6 +1377,120 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = vdm.MoveWindowToDesktop(canvas_hwnd, &guid);
                 let _ = SetForegroundWindow(canvas_hwnd);
             }
+            LRESULT(0)
+        }
+
+        msg if msg == WM_DEFERRED_PIN_ENTER => {
+            // Deferred COM calls for pin-focus desktop switching on cloaked windows.
+            // Phase 1: extract info, release borrow.
+            let pin_info = APP.with(|app| {
+                if let Some(ref state) = *app.borrow() {
+                    if let Some(ref focus) = state.pin_focus {
+                        if focus.is_cloaked {
+                            if let Some(ref vdm) = state.vdm {
+                                let non_cloaked: Vec<HWND> = state.windows.iter()
+                                    .filter(|w| !w.cloaked)
+                                    .map(|w| w.hwnd)
+                                    .collect();
+                                return Some((
+                                    vdm.clone(),
+                                    state.hwnd,
+                                    focus.target_hwnd,
+                                    focus.grid_idx,
+                                    non_cloaked,
+                                    state.last_desktop_id,
+                                ));
+                            }
+                        }
+                    }
+                }
+                None
+            });
+
+            // Phase 2: COM calls outside borrow.
+            if let Some((vdm, canvas_hwnd, target_hwnd, grid_idx, non_cloaked, cached_desktop)) = pin_info {
+                let our_desktop = get_current_desktop_id_from_hwnds(&vdm, &non_cloaked, cached_desktop);
+                let mut uncloaked = false;
+                let mut saved_desktop: Option<windows::core::GUID> = None;
+
+                // Plan A: move target to our desktop
+                if let Some(our_id) = our_desktop {
+                    if vdm.MoveWindowToDesktop(target_hwnd, &our_id).is_ok() {
+                        uncloaked = true;
+                        dbg_log("  deferred pin: Plan A succeeded (moved target to our desktop)");
+                    }
+                }
+
+                // Plan B: move canvas to target's desktop
+                if !uncloaked {
+                    if let Ok(target_desktop) = vdm.GetWindowDesktopId(target_hwnd) {
+                        if vdm.MoveWindowToDesktop(canvas_hwnd, &target_desktop).is_ok() {
+                            let _ = SetWindowPos(canvas_hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                            let _ = SetForegroundWindow(canvas_hwnd);
+                            saved_desktop = our_desktop;
+                            uncloaked = true;
+                            dbg_log("  deferred pin: Plan B succeeded (moved canvas to target desktop)");
+                        }
+                    }
+                }
+
+                if !uncloaked {
+                    dbg_log("  deferred pin: both plans failed, staying in thumbnail-only mode");
+                }
+
+                // Phase 3: re-borrow to update state if switch succeeded.
+                if uncloaked {
+                    APP.with(|app| {
+                        if let Some(ref mut state) = *app.borrow_mut() {
+                            // Verify pin focus is still for the same target
+                            let still_valid = state.pin_focus.as_ref()
+                                .map(|f| f.target_hwnd == target_hwnd && f.is_cloaked)
+                                .unwrap_or(false);
+                            if !still_valid {
+                                return;
+                            }
+
+                            if let Some(ref mut focus) = state.pin_focus {
+                                focus.is_cloaked = false;
+                                focus.saved_desktop = saved_desktop;
+                            }
+
+                            // Update window info
+                            if grid_idx < state.filtered_indices.len() {
+                                let win_idx = state.filtered_indices[grid_idx];
+                                if win_idx < state.windows.len() && state.windows[win_idx].hwnd == target_hwnd {
+                                    state.windows[win_idx].cloaked = false;
+                                    if let Some(thumb) = state.windows[win_idx].thumbnail {
+                                        unregister_thumbnail(thumb);
+                                        state.windows[win_idx].thumbnail = None;
+                                    }
+                                    let prev_sw = state.windows[win_idx].source_w;
+                                    let prev_sh = state.windows[win_idx].source_h;
+                                    let prev_cw = state.windows[win_idx].client_w;
+                                    let prev_ch = state.windows[win_idx].client_h;
+                                    register_and_measure_thumbnail(state.hwnd, &mut state.windows[win_idx]);
+                                    if state.windows[win_idx].source_w <= 0 { state.windows[win_idx].source_w = prev_sw; }
+                                    if state.windows[win_idx].source_h <= 0 { state.windows[win_idx].source_h = prev_sh; }
+                                    if state.windows[win_idx].client_w <= 0 { state.windows[win_idx].client_w = prev_cw; }
+                                    if state.windows[win_idx].client_h <= 0 { state.windows[win_idx].client_h = prev_ch; }
+                                }
+                            }
+
+                            if let Some(desk) = our_desktop {
+                                state.last_desktop_id = Some(desk);
+                            }
+
+                            // If zoom animation already completed, apply pin hole now
+                            if !state.pin_zoom_pending {
+                                apply_pin_hole(state);
+                            }
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    });
+                }
+            }
+
             LRESULT(0)
         }
 
