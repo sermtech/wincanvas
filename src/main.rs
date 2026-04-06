@@ -14,7 +14,14 @@ use thumbnails::{
 };
 
 use std::cell::RefCell;
+use std::io::Write;
 use windows::core::PCWSTR;
+
+fn dbg_log(msg: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("wincanvas_debug.log") {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, CombineRgn, CreateRectRgn, DeleteObject, InvalidateRect, SetWindowRgn,
@@ -36,6 +43,8 @@ const HOTKEY_ID: i32 = 1;
 const PIN_F1_HOTKEY_ID: i32 = 2;
 const PIN_ESC_HOTKEY_ID: i32 = 3;
 const TIMER_ID: usize = 1;
+/// Custom message: deferred desktop switch (COM calls pump messages, can't call inside RefCell borrow)
+const WM_DEFERRED_DESKTOP: u32 = WM_APP;
 const ANIM_TIMER_ID: usize = 2;
 const ANIM_INTERVAL_MS: u32 = 16;
 
@@ -79,6 +88,9 @@ struct AppState {
     qpc_freq: i64,
     vdm: Option<IVirtualDesktopManager>,
     last_desktop_id: Option<windows::core::GUID>,
+    /// Desktop GUID to switch to after releasing the RefCell borrow.
+    /// COM calls on STA pump messages, causing re-entrancy if called inside a borrow.
+    deferred_desktop: Option<windows::core::GUID>,
 }
 
 thread_local! {
@@ -86,6 +98,12 @@ thread_local! {
 }
 
 fn main() {
+    // Panic hook: log crashes to file so we can diagnose
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("PANIC: {}\n{:?}\n", info, std::backtrace::Backtrace::force_capture());
+        let _ = std::fs::write("wincanvas_crash.log", msg.as_bytes());
+    }));
+
     unsafe {
         // Must be the very first Win32 call -- enables physical pixel coordinates everywhere
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).unwrap();
@@ -173,6 +191,7 @@ fn main() {
                 &VirtualDesktopManager, None, windows::Win32::System::Com::CLSCTX_ALL,
             ).ok(),
             last_desktop_id: None,
+            deferred_desktop: None,
         };
 
         refresh_windows(&mut state);
@@ -533,17 +552,23 @@ fn ensure_canvas_on_current_desktop(state: &mut AppState) {
 /// Move our canvas to the target window's virtual desktop so the system switches there.
 /// Used for non-pin activation of cross-desktop windows (click, Enter, number keys).
 /// The overlay is hidden immediately after, so we don't need to switch back.
+/// Defer switching canvas to the target's desktop. The actual COM call happens
+/// in WM_DEFERRED_DESKTOP after the RefCell borrow is released.
 fn activate_cross_desktop(state: &mut AppState, target: HWND) {
+    dbg_log(&format!("activate_cross_desktop: target={:?}", target));
     if let Some(ref vdm) = state.vdm {
         if let Ok(target_desktop) = unsafe { vdm.GetWindowDesktopId(target) } {
+            state.deferred_desktop = Some(target_desktop);
             unsafe {
-                let _ = vdm.MoveWindowToDesktop(state.hwnd, &target_desktop);
+                let _ = PostMessageW(Some(state.hwnd), WM_DEFERRED_DESKTOP, WPARAM(0), LPARAM(0));
             }
         }
     }
 }
 
 fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
+    dbg_log(&format!("enter_pin_focus: grid_idx={} filtered_len={} windows_len={}",
+        grid_idx, state.filtered_indices.len(), state.windows.len()));
     // Exit any existing pin focus first (clears hole and animates back if needed)
     exit_pin_focus(state);
 
@@ -551,6 +576,10 @@ fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
     state.canvas.stop_inertia();
     state.canvas.anim.active = false;
 
+    if grid_idx >= state.filtered_indices.len() {
+        dbg_log("  ABORT: grid_idx out of bounds after exit_pin_focus");
+        return;
+    }
     let win_idx = state.filtered_indices[grid_idx];
     let target = state.windows[win_idx].hwnd;
 
@@ -675,6 +704,9 @@ fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
 }
 
 fn exit_pin_focus(state: &mut AppState) {
+    dbg_log(&format!("exit_pin_focus: has_focus={} saved_desktop={:?}",
+        state.pin_focus.is_some(),
+        state.pin_focus.as_ref().and_then(|f| f.saved_desktop)));
     if let Some(focus) = state.pin_focus.take() {
         state.pin_zoom_pending = false;
         // Remove hole and restore full overlay
@@ -687,11 +719,13 @@ fn exit_pin_focus(state: &mut AppState) {
                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 }
             }
-            // If we switched desktops, switch back
+            // If we switched desktops, defer the switch back.
+            // COM calls on STA pump messages -- calling MoveWindowToDesktop here
+            // re-enters wndproc while the APP RefCell is still borrowed = panic.
             if let Some(original_desktop) = focus.saved_desktop {
-                if let Some(ref vdm) = state.vdm {
-                    let _ = vdm.MoveWindowToDesktop(state.hwnd, &original_desktop);
-                }
+                dbg_log(&format!("  deferring switch back to {:?}", original_desktop));
+                state.deferred_desktop = Some(original_desktop);
+                let _ = PostMessageW(Some(state.hwnd), WM_DEFERRED_DESKTOP, WPARAM(0), LPARAM(0));
             }
             let _ = UnregisterHotKey(Some(state.hwnd), PIN_F1_HOTKEY_ID);
             let _ = UnregisterHotKey(Some(state.hwnd), PIN_ESC_HOTKEY_ID);
@@ -1303,6 +1337,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         WM_DESTROY => {
             PostQuitMessage(0);
+            LRESULT(0)
+        }
+
+        msg if msg == WM_DEFERRED_DESKTOP => {
+            // Extract deferred desktop info, then DROP the borrow before making COM calls.
+            // COM calls on STA pump messages -- must not hold RefCell borrow.
+            let switch_info: Option<(IVirtualDesktopManager, HWND, windows::core::GUID)> = APP.with(|app| {
+                if let Some(ref mut state) = *app.borrow_mut() {
+                    if let Some(guid) = state.deferred_desktop.take() {
+                        if let Some(ref vdm) = state.vdm {
+                            return Some((vdm.clone(), state.hwnd, guid));
+                        }
+                    }
+                }
+                None
+            });
+            // Borrow is released -- safe to call COM now
+            if let Some((vdm, canvas_hwnd, guid)) = switch_info {
+                dbg_log(&format!("WM_DEFERRED_DESKTOP: switching to {:?}", guid));
+                let _ = vdm.MoveWindowToDesktop(canvas_hwnd, &guid);
+                let _ = SetForegroundWindow(canvas_hwnd);
+            }
             LRESULT(0)
         }
 
