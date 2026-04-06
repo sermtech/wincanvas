@@ -438,6 +438,9 @@ fn apply_pin_hole(state: &mut AppState) {
 /// Lightweight repositioning of the pinned window + hole during pan (no debug logging).
 fn update_pin_position(state: &mut AppState) {
     if let Some(ref focus) = state.pin_focus {
+        if focus.is_cloaked {
+            return; // Thumbnail-only preview; no hole or window repositioning
+        }
         let grid_idx = focus.grid_idx;
         let target = focus.target_hwnd;
         if grid_idx >= state.canvas.layout.len() || grid_idx >= state.filtered_indices.len() {
@@ -802,12 +805,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             });
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         } else {
-                            // Plain click: activate the target window
                             let win_idx = state.filtered_indices[grid_idx];
-                            let target_hwnd = state.windows[win_idx].hwnd;
-                            let _ = ShowWindow(hwnd, SW_HIDE);
-                            state.visible = false;
-                            let _ = SetForegroundWindow(target_hwnd);
+                            if state.windows[win_idx].cloaked {
+                                // Cross-desktop window: can't activate, just select
+                                select_and_navigate(state, Some(grid_idx), false);
+                                let _ = InvalidateRect(Some(hwnd), None, false);
+                            } else {
+                                // Current-desktop: activate the target window
+                                let target_hwnd = state.windows[win_idx].hwnd;
+                                let _ = ShowWindow(hwnd, SW_HIDE);
+                                state.visible = false;
+                                let _ = SetForegroundWindow(target_hwnd);
+                            }
                         }
                     }
                 }
@@ -928,10 +937,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             if let Some(sel) = state.selected {
                                 if sel < state.filtered_indices.len() {
                                     let win_idx = state.filtered_indices[sel];
-                                    let target_hwnd = state.windows[win_idx].hwnd;
-                                    let _ = ShowWindow(hwnd, SW_HIDE);
-                                    state.visible = false;
-                                    let _ = SetForegroundWindow(target_hwnd);
+                                    if !state.windows[win_idx].cloaked {
+                                        let target_hwnd = state.windows[win_idx].hwnd;
+                                        let _ = ShowWindow(hwnd, SW_HIDE);
+                                        state.visible = false;
+                                        let _ = SetForegroundWindow(target_hwnd);
+                                    }
                                 }
                             }
                         } else if vk == VK_TAB.0 || vk == VK_RIGHT.0 {
@@ -981,10 +992,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let idx = num - 1;
                             if idx < state.filtered_indices.len() {
                                 let win_idx = state.filtered_indices[idx];
-                                let target_hwnd = state.windows[win_idx].hwnd;
-                                let _ = ShowWindow(hwnd, SW_HIDE);
-                                state.visible = false;
-                                let _ = SetForegroundWindow(target_hwnd);
+                                if !state.windows[win_idx].cloaked {
+                                    let target_hwnd = state.windows[win_idx].hwnd;
+                                    let _ = ShowWindow(hwnd, SW_HIDE);
+                                    state.visible = false;
+                                    let _ = SetForegroundWindow(target_hwnd);
+                                } else {
+                                    select_and_navigate(state, Some(idx), false);
+                                    let _ = InvalidateRect(Some(hwnd), None, false);
+                                }
                             }
                         }
                     }
