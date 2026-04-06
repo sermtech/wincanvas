@@ -28,10 +28,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_UP,
 };
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
-use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::Foundation::RECT;
-use windows::core::GUID;
 
 const HOTKEY_ID: i32 = 1;
 const PIN_F1_HOTKEY_ID: i32 = 2;
@@ -45,10 +43,10 @@ struct PinFocusState {
     target_hwnd: HWND,
     saved_placement: WINDOWPLACEMENT,
     was_topmost: bool,
+    is_cloaked: bool,
     saved_zoom: f64,
     saved_pan_x: f64,
     saved_pan_y: f64,
-    saved_desktop_id: Option<GUID>,
 }
 
 struct DragState {
@@ -76,7 +74,6 @@ struct AppState {
     hwnd: HWND,
     visible: bool,
     qpc_freq: i64,
-    vdm: Option<IVirtualDesktopManager>,
 }
 
 thread_local! {
@@ -87,12 +84,6 @@ fn main() {
     unsafe {
         // Must be the very first Win32 call -- enables physical pixel coordinates everywhere
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).unwrap();
-
-        // Initialize COM for IVirtualDesktopManager (virtual desktop filtering)
-        let _ = windows::Win32::System::Com::CoInitializeEx(
-            None,
-            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
-        );
 
         let hinstance = GetModuleHandleW(None).unwrap();
 
@@ -168,9 +159,6 @@ fn main() {
             hwnd: hwnd,
             visible: true,
             qpc_freq,
-            vdm: windows::Win32::System::Com::CoCreateInstance(
-                &VirtualDesktopManager, None, windows::Win32::System::Com::CLSCTX_ALL,
-            ).ok(),
         };
 
         refresh_windows(&mut state);
@@ -221,18 +209,9 @@ fn refresh_windows(state: &mut AppState) {
     // Sort by z-order (EnumWindows already returns in z-order, most recent first)
     // No extra work needed -- EnumWindows gives us top-to-bottom z-order
 
-    // Register thumbnails and query source/client sizes
+    // Register thumbnails and query source/client sizes (including cross-desktop windows)
     for w in &mut windows {
-        if w.cloaked {
-            // Cloaked windows (other virtual desktops): DWM thumbnails render black.
-            // Skip registration; use a default aspect ratio for layout.
-            w.source_w = 16;
-            w.source_h = 9;
-            w.client_w = 16;
-            w.client_h = 9;
-        } else {
-            register_and_measure_thumbnail(state.hwnd, w);
-        }
+        register_and_measure_thumbnail(state.hwnd, w);
     }
 
     state.windows = windows;
@@ -419,6 +398,15 @@ fn apply_pin_hole(state: &mut AppState) {
         }
 
         let tr = state.canvas.thumb_rect(grid_idx);
+
+        if focus.is_cloaked {
+            // Cross-desktop window: keep the DWM thumbnail visible as a live preview.
+            // Do NOT call SetWindowPos/SetForegroundWindow (would switch desktops).
+            // No hole punch needed -- the thumbnail stays on the overlay.
+            return;
+        }
+
+        // Current-desktop window: swap real window in behind the hole
         let (px, py, pw, ph) = compute_client_aligned_rect(target, &tr);
 
         unsafe {
@@ -478,37 +466,21 @@ fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
     };
     unsafe { let _ = GetWindowPlacement(target, &mut placement); }
 
-    // If target is on another virtual desktop (cloaked), move it to current desktop
-    let mut saved_desktop_id: Option<GUID> = None;
-    if state.windows[win_idx].cloaked {
-        if let Some(ref vdm) = state.vdm {
-            // Save original desktop so we can move it back on exit
-            if let Ok(orig_id) = unsafe { vdm.GetWindowDesktopId(target) } {
-                saved_desktop_id = Some(orig_id);
-            }
-            // Get current desktop GUID from our overlay window
-            if let Ok(cur_id) = unsafe { vdm.GetWindowDesktopId(state.hwnd) } {
-                let _ = unsafe { vdm.MoveWindowToDesktop(target, &cur_id) };
-            }
-            // Register DWM thumbnail now that window is uncloaked
-            let w = &mut state.windows[win_idx];
-            register_and_measure_thumbnail(state.hwnd, w);
-            w.cloaked = false;
+    let is_cloaked = state.windows[win_idx].cloaked;
+
+    // For current-desktop windows: restore if minimized, remove TOPMOST
+    let mut was_topmost = false;
+    if !is_cloaked {
+        if placement.showCmd == SW_SHOWMINIMIZED.0 as u32 {
+            unsafe { let _ = ShowWindow(target, SW_RESTORE); }
         }
-    }
-
-    // Restore if minimized so client size queries return valid values
-    if placement.showCmd == SW_SHOWMINIMIZED.0 as u32 {
-        unsafe { let _ = ShowWindow(target, SW_RESTORE); }
-    }
-
-    // Check if target is TOPMOST and remove it so it doesn't fight z-order
-    let ex_style = unsafe { GetWindowLongW(target, GWL_EXSTYLE) } as u32;
-    let was_topmost = ex_style & WS_EX_TOPMOST.0 != 0;
-    if was_topmost {
-        unsafe {
-            let _ = SetWindowPos(target, Some(HWND_NOTOPMOST), 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        let ex_style = unsafe { GetWindowLongW(target, GWL_EXSTYLE) } as u32;
+        was_topmost = ex_style & WS_EX_TOPMOST.0 != 0;
+        if was_topmost {
+            unsafe {
+                let _ = SetWindowPos(target, Some(HWND_NOTOPMOST), 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
         }
     }
 
@@ -546,10 +518,10 @@ fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
         target_hwnd: target,
         saved_placement: placement,
         was_topmost,
+        is_cloaked,
         saved_zoom,
         saved_pan_x,
         saved_pan_y,
-        saved_desktop_id,
     });
 }
 
@@ -559,17 +531,11 @@ fn exit_pin_focus(state: &mut AppState) {
         // Remove hole and restore full overlay
         clear_region_hole(state.hwnd);
         unsafe {
-            if IsWindow(Some(focus.target_hwnd)).as_bool() {
+            if !focus.is_cloaked && IsWindow(Some(focus.target_hwnd)).as_bool() {
                 let _ = SetWindowPlacement(focus.target_hwnd, &focus.saved_placement);
                 if focus.was_topmost {
                     let _ = SetWindowPos(focus.target_hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0,
                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                }
-                // Move window back to its original virtual desktop if it was moved
-                if let Some(orig_desktop) = focus.saved_desktop_id {
-                    if let Some(ref vdm) = state.vdm {
-                        let _ = vdm.MoveWindowToDesktop(focus.target_hwnd, &orig_desktop);
-                    }
                 }
             }
             let _ = UnregisterHotKey(Some(state.hwnd), PIN_F1_HOTKEY_ID);
@@ -620,12 +586,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             }
                             let cr = state.canvas.cell_rect(grid_idx);
                             let winfo = &state.windows[win_idx];
-
-                            // Cloaked windows: draw placeholder instead of relying on DWM thumbnail
-                            if winfo.cloaked {
-                                let thumb_r = state.canvas.thumb_rect(grid_idx);
-                                render.draw_cloaked_placeholder(thumb_r, &winfo.title, &winfo.process_name);
-                            }
 
                             if state.pin_mode && state.pin_focus.as_ref().map(|f| f.grid_idx) == Some(grid_idx) {
                                 render.draw_pin_focus_border(cr);
