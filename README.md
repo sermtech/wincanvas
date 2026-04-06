@@ -8,6 +8,8 @@ WinCanvas is a lightweight **window switcher and virtual desktop manager** for W
 
 ![screenshot](assets/screenshot.png)
 
+![screenshot2](assets/screenshot2.png)
+
 ## Requirements
 
 - Windows 10 / 11 with DWM enabled (default)
