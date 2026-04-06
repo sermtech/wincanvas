@@ -43,6 +43,9 @@ struct PinFocusState {
     target_hwnd: HWND,
     saved_placement: WINDOWPLACEMENT,
     was_topmost: bool,
+    saved_zoom: f64,
+    saved_pan_x: f64,
+    saved_pan_y: f64,
 }
 
 struct DragState {
@@ -66,6 +69,7 @@ struct AppState {
     custom_order: Vec<isize>,
     pin_mode: bool,
     pin_focus: Option<PinFocusState>,
+    pin_zoom_pending: bool,
     hwnd: HWND,
     visible: bool,
     qpc_freq: i64,
@@ -150,6 +154,7 @@ fn main() {
             custom_order: Vec::new(),
             pin_mode: false,
             pin_focus: None,
+            pin_zoom_pending: false,
             hwnd: hwnd,
             visible: true,
             qpc_freq,
@@ -379,8 +384,29 @@ fn clear_region_hole(hwnd: HWND) {
     }
 }
 
+/// After the zoom-in animation completes, position the real window and punch the hole.
+fn apply_pin_hole(state: &mut AppState) {
+    if let Some(ref focus) = state.pin_focus {
+        let grid_idx = focus.grid_idx;
+        let target = focus.target_hwnd;
+        let tr = state.canvas.thumb_rect(grid_idx);
+        unsafe {
+            let (px, py, pw, ph) = compute_client_aligned_rect(target, &tr);
+            let _ = SetWindowPos(target, Some(HWND_TOP), px, py, pw, ph,
+                SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            let _ = SetForegroundWindow(target);
+        }
+        apply_region_hole(state.hwnd, &tr);
+        let win_idx = state.filtered_indices[grid_idx];
+        if let Some(thumb) = state.windows[win_idx].thumbnail {
+            let hide = RECT { left: -1, top: -1, right: -1, bottom: -1 };
+            update_thumbnail(thumb, hide, 0, 0, 0);
+        }
+    }
+}
+
 fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
-    // Exit any existing pin focus first
+    // Exit any existing pin focus first (clears hole and animates back if needed)
     exit_pin_focus(state);
 
     let win_idx = state.filtered_indices[grid_idx];
@@ -393,81 +419,81 @@ fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
     };
     unsafe { let _ = GetWindowPlacement(target, &mut placement); }
 
-    // Restore if minimized so GetWindowRect/GetClientRect return valid values
+    // Restore if minimized so client size queries return valid values
     if placement.showCmd == SW_SHOWMINIMIZED.0 as u32 {
         unsafe { let _ = ShowWindow(target, SW_RESTORE); }
     }
 
-    // Check if target is TOPMOST and remove it if so
+    // Check if target is TOPMOST and remove it so it doesn't fight z-order
     let ex_style = unsafe { GetWindowLongW(target, GWL_EXSTYLE) } as u32;
     let was_topmost = ex_style & WS_EX_TOPMOST.0 != 0;
     if was_topmost {
         unsafe {
-            let _ = SetWindowPos(
-                target, Some(HWND_NOTOPMOST), 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
+            let _ = SetWindowPos(target, Some(HWND_NOTOPMOST), 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
     }
 
-    // Align target's client area with thumb_rect
-    let tr = state.canvas.thumb_rect(grid_idx);
-    let (px, py, pw, ph) = compute_client_aligned_rect(target, &tr);
-
+    // Register hotkeys now so F1/Escape work during the animation
     unsafe {
-        let _ = SetWindowPos(
-            target, Some(HWND_TOP), px, py, pw, ph,
-            SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        );
-
-        // Give keyboard focus to target
-        let _ = SetForegroundWindow(target);
-
-        // Register F1 and Escape as global hotkeys for exiting pin focus
         let _ = RegisterHotKey(Some(state.hwnd), PIN_F1_HOTKEY_ID, MOD_NOREPEAT, VK_F1.0 as u32);
         let _ = RegisterHotKey(Some(state.hwnd), PIN_ESC_HOTKEY_ID, MOD_NOREPEAT, VK_ESCAPE.0 as u32);
     }
 
-    // Punch a hole in the overlay so clicks reach the real window
-    apply_region_hole(state.hwnd, &tr);
+    // Calculate target zoom+pan to center this cell at the window's original client size
+    let client_w = state.windows[win_idx].client_w;
+    let client_h = state.windows[win_idx].client_h;
+    let (target_zoom, target_pan_x, target_pan_y) =
+        state.canvas.calc_pin_target(grid_idx, client_w, client_h);
 
-    // Hide DWM thumbnail for the focused window -- real window visible through hole
-    if let Some(thumb) = state.windows[win_idx].thumbnail {
-        let hide = RECT { left: -1, top: -1, right: -1, bottom: -1 };
-        update_thumbnail(thumb, hide, 0, 0, 0);
-    }
+    // Save current canvas view for restoration on exit
+    let saved_zoom = state.canvas.zoom;
+    let saved_pan_x = state.canvas.pan_x;
+    let saved_pan_y = state.canvas.pan_y;
 
+    // Start zoom+pan animation -- hole is applied when it completes
+    let now = unsafe { let mut t: i64 = 0; let _ = QueryPerformanceCounter(&mut t); t };
+    state.canvas.animate_zoom_pan_to(target_zoom, target_pan_x, target_pan_y, state.qpc_freq, now);
+    unsafe { let _ = SetTimer(Some(state.hwnd), ANIM_TIMER_ID, ANIM_INTERVAL_MS, None); }
+
+    state.pin_zoom_pending = true;
     state.pin_focus = Some(PinFocusState {
         grid_idx,
         target_hwnd: target,
         saved_placement: placement,
         was_topmost,
+        saved_zoom,
+        saved_pan_x,
+        saved_pan_y,
     });
 }
 
 fn exit_pin_focus(state: &mut AppState) {
     if let Some(focus) = state.pin_focus.take() {
-        // Remove the region hole, restoring full overlay
+        state.pin_zoom_pending = false;
+        // Remove hole and restore full overlay
         clear_region_hole(state.hwnd);
         unsafe {
-            // Restore original position/size
             if IsWindow(Some(focus.target_hwnd)).as_bool() {
                 let _ = SetWindowPlacement(focus.target_hwnd, &focus.saved_placement);
-                // Restore TOPMOST if it was originally set
                 if focus.was_topmost {
-                    let _ = SetWindowPos(
-                        focus.target_hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                    );
+                    let _ = SetWindowPos(focus.target_hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 }
             }
-            // Unregister pin hotkeys
             let _ = UnregisterHotKey(Some(state.hwnd), PIN_F1_HOTKEY_ID);
             let _ = UnregisterHotKey(Some(state.hwnd), PIN_ESC_HOTKEY_ID);
-            // Refocus overlay
             let _ = SetForegroundWindow(state.hwnd);
         }
+        // Re-show DWM thumbnails so they're visible during zoom-out animation
         update_all_thumbnails(state);
+        // Animate zoom+pan back to original canvas view
+        let now = unsafe { let mut t: i64 = 0; let _ = QueryPerformanceCounter(&mut t); t };
+        state.canvas.animate_zoom_pan_to(
+            focus.saved_zoom, focus.saved_pan_x, focus.saved_pan_y,
+            state.qpc_freq, now,
+        );
+        unsafe { let _ = SetTimer(Some(state.hwnd), ANIM_TIMER_ID, ANIM_INTERVAL_MS, None); }
     }
 }
 
@@ -543,8 +569,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             APP.with(|app| {
                 if let Some(ref mut state) = *app.borrow_mut() {
-                    // Pin focus active: ignore scroll on overlay (target gets it via focus)
-                    if state.pin_focus.is_some() {
+                    // Pin focus active (or animating in): ignore scroll on overlay
+                    if state.pin_focus.is_some() || state.pin_zoom_pending {
                         return;
                     }
                     let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
@@ -563,8 +589,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             APP.with(|app| {
                 if let Some(ref mut state) = *app.borrow_mut() {
-                    // Pin focus active: ignore (right-clicks pass through the region hole)
-                    if state.pin_focus.is_some() {
+                    // Pin focus active (or animating in): ignore right-click pan
+                    if state.pin_focus.is_some() || state.pin_zoom_pending {
                         return;
                     }
                     state.canvas.anim.active = false;
@@ -980,6 +1006,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let _ = InvalidateRect(Some(hwnd), None, false);
                         if !still_going {
                             let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
+                            // Zoom-in animation completed: position window and punch hole
+                            if state.pin_zoom_pending {
+                                state.pin_zoom_pending = false;
+                                apply_pin_hole(state);
+                            }
                         }
                     }
                 });

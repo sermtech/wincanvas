@@ -21,6 +21,8 @@ pub struct PanAnimation {
     pub start_y: f64,
     pub target_x: f64,
     pub target_y: f64,
+    pub start_zoom: f64,
+    pub target_zoom: f64,
     pub start_ticks: i64,
     pub duration_ticks: i64,
     pub active: bool,
@@ -59,6 +61,8 @@ impl CanvasState {
                 start_y: 0.0,
                 target_x: 0.0,
                 target_y: 0.0,
+                start_zoom: 1.0,
+                target_zoom: 1.0,
                 start_ticks: 0,
                 duration_ticks: 0,
                 active: false,
@@ -389,10 +393,45 @@ impl CanvasState {
             start_y: self.pan_y,
             target_x,
             target_y,
+            start_zoom: self.zoom,
+            target_zoom: self.zoom,
             start_ticks: now,
             duration_ticks: freq * 200 / 1000, // 200ms
             active: true,
         };
+    }
+
+    pub fn animate_zoom_pan_to(&mut self, target_zoom: f64, target_x: f64, target_y: f64, freq: i64, now: i64) {
+        self.anim = PanAnimation {
+            start_x: self.pan_x,
+            start_y: self.pan_y,
+            target_x,
+            target_y,
+            start_zoom: self.zoom,
+            target_zoom,
+            start_ticks: now,
+            duration_ticks: freq * 300 / 1000, // 300ms
+            active: true,
+        };
+    }
+
+    /// Calculate target zoom and pan to center grid_idx on screen at the window's original client size.
+    pub fn calc_pin_target(&self, grid_idx: usize, client_w: i32, client_h: i32) -> (f64, f64, f64) {
+        let c = &self.layout[grid_idx];
+        let inset = THUMB_INSET as f64 * 2.0;
+        let zoom_w = (client_w as f64 + inset) / c.w;
+        let zoom_h = (client_h as f64 + inset) / c.h;
+        let mut target_zoom = zoom_w.min(zoom_h);
+        // Cap so the cell fits on screen
+        let max_zoom_w = self.canvas_w / c.w;
+        let max_zoom_h = self.canvas_h / c.h;
+        target_zoom = target_zoom.min(max_zoom_w).min(max_zoom_h);
+        // Center cell on screen
+        let cx = c.x + c.w / 2.0;
+        let cy = c.y + c.h / 2.0;
+        let pan_x = self.canvas_w / 2.0 - cx * target_zoom;
+        let pan_y = self.canvas_h / 2.0 - cy * target_zoom;
+        (target_zoom, pan_x, pan_y)
     }
 
     pub fn tick_animation(&mut self, now: i64) -> bool {
@@ -403,6 +442,7 @@ impl CanvasState {
         if elapsed >= self.anim.duration_ticks {
             self.pan_x = self.anim.target_x;
             self.pan_y = self.anim.target_y;
+            self.zoom = self.anim.target_zoom;
             self.anim.active = false;
             return true;
         }
@@ -410,6 +450,7 @@ impl CanvasState {
         let e = ease_out_cubic(t);
         self.pan_x = self.anim.start_x + (self.anim.target_x - self.anim.start_x) * e;
         self.pan_y = self.anim.start_y + (self.anim.target_y - self.anim.start_y) * e;
+        self.zoom = self.anim.start_zoom + (self.anim.target_zoom - self.anim.start_zoom) * e;
         true
     }
 }
