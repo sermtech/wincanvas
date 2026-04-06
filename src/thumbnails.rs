@@ -192,6 +192,20 @@ pub fn update_thumbnail(thumb: isize, dest_rect: RECT, source_w: i32, source_h: 
     }
 }
 
+/// Register a DWM thumbnail for a window and measure its source/client dimensions.
+/// Updates the WindowInfo in place. Used when uncloaking a window during pin focus.
+pub fn register_and_measure_thumbnail(dest: HWND, w: &mut WindowInfo) {
+    w.thumbnail = register_thumbnail(dest, w.hwnd);
+    if let Some(thumb) = w.thumbnail {
+        let (sw, sh) = query_source_size(thumb);
+        w.source_w = sw;
+        w.source_h = sh;
+    }
+    let (cw, ch) = query_client_area_size(w.hwnd);
+    w.client_w = cw;
+    w.client_h = ch;
+}
+
 pub fn unregister_thumbnail(thumb: isize) {
     unsafe {
         let _ = DwmUnregisterThumbnail(thumb);

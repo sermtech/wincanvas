@@ -397,8 +397,9 @@ impl RenderContext {
             self.target.DrawRoundedRectangle(&rounded, &self.cloaked_border_brush, 1.5, None);
 
             // Centered label: process name + title
-            let label = if title.len() > 40 {
-                format!("{}\n{}...", process_name, &title[..37])
+            let short_title: String = title.chars().take(37).collect();
+            let label = if title.chars().count() > 40 {
+                format!("{}\n{}...", process_name, short_title)
             } else {
                 format!("{}\n{}", process_name, title)
             };

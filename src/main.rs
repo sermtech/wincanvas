@@ -9,8 +9,8 @@ use canvas::CanvasState;
 use render::RenderContext;
 use search::SearchState;
 use thumbnails::{
-    enumerate_windows_v2, query_client_area_size, query_source_size, register_thumbnail,
-    unregister_thumbnail, update_thumbnail, WindowInfo,
+    enumerate_windows_v2, register_and_measure_thumbnail, unregister_thumbnail, update_thumbnail,
+    WindowInfo,
 };
 
 use std::cell::RefCell;
@@ -27,7 +27,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F1, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB,
     VK_UP,
 };
-use windows::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::Foundation::RECT;
@@ -231,15 +231,7 @@ fn refresh_windows(state: &mut AppState) {
             w.client_w = 16;
             w.client_h = 9;
         } else {
-            w.thumbnail = register_thumbnail(state.hwnd, w.hwnd);
-            if let Some(thumb) = w.thumbnail {
-                let (sw, sh) = query_source_size(thumb);
-                w.source_w = sw;
-                w.source_h = sh;
-            }
-            let (cw, ch) = query_client_area_size(w.hwnd);
-            w.client_w = cw;
-            w.client_h = ch;
+            register_and_measure_thumbnail(state.hwnd, w);
         }
     }
 
@@ -429,79 +421,22 @@ fn apply_pin_hole(state: &mut AppState) {
         let tr = state.canvas.thumb_rect(grid_idx);
         let (px, py, pw, ph) = compute_client_aligned_rect(target, &tr);
 
-        // --- DEBUG: log coordinates + DPI to file ---
-        {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true).append(true)
-                .open("C:\\PROJECTS\\wincanvas\\pin_debug.log")
-            {
-                let overlay_dpi = unsafe { GetDpiForWindow(state.hwnd) };
-                let target_dpi = unsafe { GetDpiForWindow(target) };
+        unsafe {
+            let _ = SetWindowPos(target, Some(HWND_TOP), px, py, pw, ph,
+                SWP_NOACTIVATE | SWP_FRAMECHANGED);
 
-                let mut wr_before = RECT::default();
-                unsafe { let _ = GetWindowRect(target, &mut wr_before); }
-
-                let swp_ok = unsafe {
-                    SetWindowPos(target, Some(HWND_TOP), px, py, pw, ph,
-                        SWP_NOACTIVATE | SWP_FRAMECHANGED).is_ok()
-                };
-
-                let mut wr_after = RECT::default();
-                unsafe { let _ = GetWindowRect(target, &mut wr_after); }
-
-                // Check actual client position after SetWindowPos
-                let mut actual_cp = POINT { x: 0, y: 0 };
-                unsafe { let _ = ClientToScreen(target, &mut actual_cp); }
-                let dx = tr.left - actual_cp.x;
-                let dy = tr.top - actual_cp.y;
-
-                let _ = writeln!(f,
-                    "--- apply_pin_hole ---\n\
-                     target HWND: {:?}\n\
-                     overlay_dpi={} target_dpi={}\n\
-                     zoom={:.3} pan=({:.1},{:.1})\n\
-                     thumb_rect: ({},{},{},{}) [{}x{}]\n\
-                     compute_client_aligned: px={} py={} pw={} ph={}\n\
-                     SetWindowPos ok: {}\n\
-                     GetWindowRect BEFORE: ({},{},{},{}) [{}x{}]\n\
-                     GetWindowRect AFTER:  ({},{},{},{}) [{}x{}]\n\
-                     ClientToScreen AFTER: ({},{})\n\
-                     client offset from hole: dx={} dy={}\n",
-                    target.0,
-                    overlay_dpi, target_dpi,
-                    state.canvas.zoom, state.canvas.pan_x, state.canvas.pan_y,
-                    tr.left, tr.top, tr.right, tr.bottom,
-                    tr.right - tr.left, tr.bottom - tr.top,
-                    px, py, pw, ph,
-                    swp_ok,
-                    wr_before.left, wr_before.top, wr_before.right, wr_before.bottom,
-                    wr_before.right - wr_before.left, wr_before.bottom - wr_before.top,
-                    wr_after.left, wr_after.top, wr_after.right, wr_after.bottom,
-                    wr_after.right - wr_after.left, wr_after.bottom - wr_after.top,
-                    actual_cp.x, actual_cp.y,
-                    dx, dy,
-                );
-
-                // DPI correction: if client area ended up at wrong position, adjust
-                if dx != 0 || dy != 0 {
-                    let swp2_ok = unsafe {
-                        SetWindowPos(target, Some(HWND_TOP), px + dx, py + dy, pw, ph,
-                            SWP_NOACTIVATE | SWP_FRAMECHANGED).is_ok()
-                    };
-                    let mut cp2 = POINT { x: 0, y: 0 };
-                    unsafe { let _ = ClientToScreen(target, &mut cp2); }
-                    let _ = writeln!(f,
-                        "DPI correction applied: dx={} dy={} swp2_ok={}\n\
-                         ClientToScreen AFTER correction: ({},{})\n",
-                        dx, dy, swp2_ok, cp2.x, cp2.y);
-                }
-
-                let _ = writeln!(f, "SetForegroundWindow: {}",
-                    unsafe { SetForegroundWindow(target).as_bool() });
+            // DPI correction: if the client area landed at the wrong position, nudge
+            let mut actual_cp = POINT { x: 0, y: 0 };
+            let _ = ClientToScreen(target, &mut actual_cp);
+            let dx = tr.left - actual_cp.x;
+            let dy = tr.top - actual_cp.y;
+            if dx != 0 || dy != 0 {
+                let _ = SetWindowPos(target, Some(HWND_TOP), px + dx, py + dy, pw, ph,
+                    SWP_NOACTIVATE | SWP_FRAMECHANGED);
             }
+
+            let _ = SetForegroundWindow(target);
         }
-        // --- END DEBUG ---
 
         apply_region_hole(state.hwnd, &tr);
         let win_idx = state.filtered_indices[grid_idx];
@@ -555,17 +490,9 @@ fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
             if let Ok(cur_id) = unsafe { vdm.GetWindowDesktopId(state.hwnd) } {
                 let _ = unsafe { vdm.MoveWindowToDesktop(target, &cur_id) };
             }
-            // Register DWM thumbnail now that window is (hopefully) uncloaked
+            // Register DWM thumbnail now that window is uncloaked
             let w = &mut state.windows[win_idx];
-            w.thumbnail = register_thumbnail(state.hwnd, w.hwnd);
-            if let Some(thumb) = w.thumbnail {
-                let (sw, sh) = query_source_size(thumb);
-                w.source_w = sw;
-                w.source_h = sh;
-            }
-            let (cw, ch) = query_client_area_size(w.hwnd);
-            w.client_w = cw;
-            w.client_h = ch;
+            register_and_measure_thumbnail(state.hwnd, w);
             w.cloaked = false;
         }
     }
@@ -718,8 +645,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             // Title below the cell
                             let tr = state.canvas.title_rect(grid_idx);
                             let full = format!("[{}] {}", winfo.process_name, winfo.title);
-                            let display_title = if full.len() > 45 {
-                                format!("{}...", &full[..42])
+                            let display_title = if full.chars().count() > 45 {
+                                let truncated: String = full.chars().take(42).collect();
+                                format!("{}...", truncated)
                             } else {
                                 full
                             };
