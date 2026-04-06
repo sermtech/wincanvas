@@ -93,6 +93,8 @@ struct AppState {
     /// Desktop GUID to switch to after releasing the RefCell borrow.
     /// COM calls on STA pump messages, causing re-entrancy if called inside a borrow.
     deferred_desktop: Option<windows::core::GUID>,
+    /// If set, WM_DEFERRED_DESKTOP should focus this target and hide the canvas after switching.
+    deferred_activate_target: Option<HWND>,
 }
 
 thread_local! {
@@ -197,6 +199,7 @@ fn main() {
             ).ok(),
             last_desktop_id: None,
             deferred_desktop: None,
+            deferred_activate_target: None,
         };
 
         refresh_windows(&mut state);
@@ -601,6 +604,7 @@ fn activate_cross_desktop(state: &mut AppState, target: HWND) {
         IN_COM_CALL.with(|c| c.set(false));
         if let Ok(target_desktop) = result {
             state.deferred_desktop = Some(target_desktop);
+            state.deferred_activate_target = Some(target);
             unsafe {
                 let _ = PostMessageW(Some(state.hwnd), WM_DEFERRED_DESKTOP, WPARAM(0), LPARAM(0));
             }
@@ -1026,12 +1030,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let target_hwnd = state.windows[win_idx].hwnd;
                             let is_cloaked = state.windows[win_idx].cloaked;
                             if is_cloaked {
-                                // Move canvas to target's desktop so the switch happens
+                                // Deferred: switch desktop, focus target, then hide canvas
                                 activate_cross_desktop(state, target_hwnd);
+                            } else {
+                                let _ = ShowWindow(hwnd, SW_HIDE);
+                                state.visible = false;
+                                let _ = SetForegroundWindow(target_hwnd);
                             }
-                            let _ = ShowWindow(hwnd, SW_HIDE);
-                            state.visible = false;
-                            let _ = SetForegroundWindow(target_hwnd);
                         }
                     }
                 }
@@ -1155,10 +1160,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                     let target_hwnd = state.windows[win_idx].hwnd;
                                     if state.windows[win_idx].cloaked {
                                         activate_cross_desktop(state, target_hwnd);
+                                    } else {
+                                        let _ = ShowWindow(hwnd, SW_HIDE);
+                                        state.visible = false;
+                                        let _ = SetForegroundWindow(target_hwnd);
                                     }
-                                    let _ = ShowWindow(hwnd, SW_HIDE);
-                                    state.visible = false;
-                                    let _ = SetForegroundWindow(target_hwnd);
                                 }
                             }
                         } else if vk == VK_TAB.0 || vk == VK_RIGHT.0 {
@@ -1211,10 +1217,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 let target_hwnd = state.windows[win_idx].hwnd;
                                 if state.windows[win_idx].cloaked {
                                     activate_cross_desktop(state, target_hwnd);
+                                } else {
+                                    let _ = ShowWindow(hwnd, SW_HIDE);
+                                    state.visible = false;
+                                    let _ = SetForegroundWindow(target_hwnd);
                                 }
-                                let _ = ShowWindow(hwnd, SW_HIDE);
-                                state.visible = false;
-                                let _ = SetForegroundWindow(target_hwnd);
                             }
                         }
                     }
@@ -1361,21 +1368,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         msg if msg == WM_DEFERRED_DESKTOP => {
             // Extract deferred desktop info, then DROP the borrow before making COM calls.
             // COM calls on STA pump messages -- must not hold RefCell borrow.
-            let switch_info: Option<(IVirtualDesktopManager, HWND, windows::core::GUID)> = APP.with(|app| {
+            let switch_info: Option<(IVirtualDesktopManager, HWND, windows::core::GUID, Option<HWND>)> = APP.with(|app| {
                 if let Some(ref mut state) = *app.borrow_mut() {
                     if let Some(guid) = state.deferred_desktop.take() {
                         if let Some(ref vdm) = state.vdm {
-                            return Some((vdm.clone(), state.hwnd, guid));
+                            let target = state.deferred_activate_target.take();
+                            return Some((vdm.clone(), state.hwnd, guid, target));
                         }
                     }
                 }
                 None
             });
             // Borrow is released -- safe to call COM now
-            if let Some((vdm, canvas_hwnd, guid)) = switch_info {
+            if let Some((vdm, canvas_hwnd, guid, activate_target)) = switch_info {
                 dbg_log(&format!("WM_DEFERRED_DESKTOP: switching to {:?}", guid));
                 let _ = vdm.MoveWindowToDesktop(canvas_hwnd, &guid);
                 let _ = SetForegroundWindow(canvas_hwnd);
+                if let Some(target) = activate_target {
+                    // Normal click activation: focus the target window and hide canvas
+                    let _ = SetForegroundWindow(target);
+                    let _ = ShowWindow(canvas_hwnd, SW_HIDE);
+                    APP.with(|app| {
+                        if let Some(ref mut state) = *app.borrow_mut() {
+                            state.visible = false;
+                        }
+                    });
+                }
             }
             LRESULT(0)
         }
