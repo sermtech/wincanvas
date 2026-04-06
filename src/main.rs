@@ -28,6 +28,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_UP,
 };
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::Foundation::RECT;
 
@@ -74,6 +75,7 @@ struct AppState {
     hwnd: HWND,
     visible: bool,
     qpc_freq: i64,
+    vdm: Option<IVirtualDesktopManager>,
 }
 
 thread_local! {
@@ -84,6 +86,11 @@ fn main() {
     unsafe {
         // Must be the very first Win32 call -- enables physical pixel coordinates everywhere
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).unwrap();
+
+        let _ = windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+        );
 
         let hinstance = GetModuleHandleW(None).unwrap();
 
@@ -159,6 +166,9 @@ fn main() {
             hwnd: hwnd,
             visible: true,
             qpc_freq,
+            vdm: windows::Win32::System::Com::CoCreateInstance(
+                &VirtualDesktopManager, None, windows::Win32::System::Com::CLSCTX_ALL,
+            ).ok(),
         };
 
         refresh_windows(&mut state);
@@ -397,6 +407,12 @@ fn apply_pin_hole(state: &mut AppState) {
             return;
         }
 
+        // Guard: verify index still maps to the same window after potential list rebuild
+        let win_idx = state.filtered_indices[grid_idx];
+        if win_idx >= state.windows.len() || state.windows[win_idx].hwnd != target {
+            return;
+        }
+
         let tr = state.canvas.thumb_rect(grid_idx);
 
         if focus.is_cloaked {
@@ -427,7 +443,6 @@ fn apply_pin_hole(state: &mut AppState) {
         }
 
         apply_region_hole(state.hwnd, &tr);
-        let win_idx = state.filtered_indices[grid_idx];
         if let Some(thumb) = state.windows[win_idx].thumbnail {
             let hide = RECT { left: -1, top: -1, right: -1, bottom: -1 };
             update_thumbnail(thumb, hide, 0, 0, 0);
@@ -455,6 +470,28 @@ fn update_pin_position(state: &mut AppState) {
     }
 }
 
+/// Move the canvas to whichever virtual desktop the user is currently on.
+fn ensure_canvas_on_current_desktop(state: &AppState) {
+    if let Some(ref vdm) = state.vdm {
+        unsafe {
+            if let Ok(on_current) = vdm.IsWindowOnCurrentVirtualDesktop(state.hwnd) {
+                if on_current.as_bool() { return; }
+            }
+            // Use foreground window as reference; fall back to taskbar (always on current desktop)
+            let fg = GetForegroundWindow();
+            let tray_class: Vec<u16> = "Shell_TrayWnd\0".encode_utf16().collect();
+            let probe = if !fg.0.is_null() { fg } else {
+                FindWindowW(PCWSTR(tray_class.as_ptr()), None).unwrap_or(HWND::default())
+            };
+            if !probe.0.is_null() {
+                if let Ok(desktop_id) = vdm.GetWindowDesktopId(probe) {
+                    let _ = vdm.MoveWindowToDesktop(state.hwnd, &desktop_id);
+                }
+            }
+        }
+    }
+}
+
 fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
     // Exit any existing pin focus first (clears hole and animates back if needed)
     exit_pin_focus(state);
@@ -469,7 +506,35 @@ fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
     };
     unsafe { let _ = GetWindowPlacement(target, &mut placement); }
 
-    let is_cloaked = state.windows[win_idx].cloaked;
+    let mut is_cloaked = state.windows[win_idx].cloaked;
+
+    // For cloaked (cross-desktop) windows: move canvas to that desktop first
+    if is_cloaked {
+        if let Some(ref vdm) = state.vdm {
+            unsafe {
+                if let Ok(target_desktop) = vdm.GetWindowDesktopId(target) {
+                    let _ = vdm.MoveWindowToDesktop(state.hwnd, &target_desktop);
+                    let _ = SetForegroundWindow(target);
+                    // Reclaim top position without relying on foreground lock
+                    let _ = SetWindowPos(state.hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    let _ = SetForegroundWindow(state.hwnd);
+                }
+            }
+            state.windows[win_idx].cloaked = false;
+            is_cloaked = false;
+            // Re-measure; keep existing dimensions if DWM returns zeros (async uncloaking)
+            let prev_sw = state.windows[win_idx].source_w;
+            let prev_sh = state.windows[win_idx].source_h;
+            let prev_cw = state.windows[win_idx].client_w;
+            let prev_ch = state.windows[win_idx].client_h;
+            register_and_measure_thumbnail(state.hwnd, &mut state.windows[win_idx]);
+            if state.windows[win_idx].source_w <= 0 { state.windows[win_idx].source_w = prev_sw; }
+            if state.windows[win_idx].source_h <= 0 { state.windows[win_idx].source_h = prev_sh; }
+            if state.windows[win_idx].client_w <= 0 { state.windows[win_idx].client_w = prev_cw; }
+            if state.windows[win_idx].client_h <= 0 { state.windows[win_idx].client_h = prev_ch; }
+        }
+    }
 
     // For current-desktop windows: restore if minimized, remove TOPMOST
     let mut was_topmost = false;
@@ -806,17 +871,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         } else {
                             let win_idx = state.filtered_indices[grid_idx];
-                            if state.windows[win_idx].cloaked {
-                                // Cross-desktop window: can't activate, just select
-                                select_and_navigate(state, Some(grid_idx), false);
-                                let _ = InvalidateRect(Some(hwnd), None, false);
-                            } else {
-                                // Current-desktop: activate the target window
-                                let target_hwnd = state.windows[win_idx].hwnd;
-                                let _ = ShowWindow(hwnd, SW_HIDE);
-                                state.visible = false;
-                                let _ = SetForegroundWindow(target_hwnd);
-                            }
+                            let target_hwnd = state.windows[win_idx].hwnd;
+                            let _ = ShowWindow(hwnd, SW_HIDE);
+                            state.visible = false;
+                            let _ = SetForegroundWindow(target_hwnd);
                         }
                     }
                 }
@@ -937,12 +995,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             if let Some(sel) = state.selected {
                                 if sel < state.filtered_indices.len() {
                                     let win_idx = state.filtered_indices[sel];
-                                    if !state.windows[win_idx].cloaked {
-                                        let target_hwnd = state.windows[win_idx].hwnd;
-                                        let _ = ShowWindow(hwnd, SW_HIDE);
-                                        state.visible = false;
-                                        let _ = SetForegroundWindow(target_hwnd);
-                                    }
+                                    let target_hwnd = state.windows[win_idx].hwnd;
+                                    let _ = ShowWindow(hwnd, SW_HIDE);
+                                    state.visible = false;
+                                    let _ = SetForegroundWindow(target_hwnd);
                                 }
                             }
                         } else if vk == VK_TAB.0 || vk == VK_RIGHT.0 {
@@ -992,15 +1048,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let idx = num - 1;
                             if idx < state.filtered_indices.len() {
                                 let win_idx = state.filtered_indices[idx];
-                                if !state.windows[win_idx].cloaked {
-                                    let target_hwnd = state.windows[win_idx].hwnd;
-                                    let _ = ShowWindow(hwnd, SW_HIDE);
-                                    state.visible = false;
-                                    let _ = SetForegroundWindow(target_hwnd);
-                                } else {
-                                    select_and_navigate(state, Some(idx), false);
-                                    let _ = InvalidateRect(Some(hwnd), None, false);
-                                }
+                                let target_hwnd = state.windows[win_idx].hwnd;
+                                let _ = ShowWindow(hwnd, SW_HIDE);
+                                state.visible = false;
+                                let _ = SetForegroundWindow(target_hwnd);
                             }
                         }
                     }
@@ -1021,6 +1072,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 let _ = ShowWindow(hwnd, SW_HIDE);
                                 state.visible = false;
                             } else {
+                                ensure_canvas_on_current_desktop(state);
                                 let _ = ShowWindow(hwnd, SW_SHOW);
                                 let _ = SetForegroundWindow(hwnd);
                                 state.visible = true;
