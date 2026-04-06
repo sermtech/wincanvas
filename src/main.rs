@@ -21,7 +21,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, RegisterHotKey, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT, VK_BACK,
-    VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
+    VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F1, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB,
+    VK_UP,
 };
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -368,6 +369,11 @@ fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
     };
     unsafe { let _ = GetWindowPlacement(target, &mut placement); }
 
+    // Restore if minimized so GetWindowRect/GetClientRect return valid values
+    if placement.showCmd == SW_SHOWMINIMIZED.0 as u32 {
+        unsafe { let _ = ShowWindow(target, SW_RESTORE); }
+    }
+
     // Check if target is TOPMOST and remove it if so
     let ex_style = unsafe { GetWindowLongW(target, GWL_EXSTYLE) } as u32;
     let was_topmost = ex_style & WS_EX_TOPMOST.0 != 0;
@@ -394,7 +400,7 @@ fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
         let _ = SetForegroundWindow(target);
 
         // Register F1 and Escape as global hotkeys for exiting pin focus
-        let _ = RegisterHotKey(Some(state.hwnd), PIN_F1_HOTKEY_ID, MOD_NOREPEAT, 0x70);
+        let _ = RegisterHotKey(Some(state.hwnd), PIN_F1_HOTKEY_ID, MOD_NOREPEAT, VK_F1.0 as u32);
         let _ = RegisterHotKey(Some(state.hwnd), PIN_ESC_HOTKEY_ID, MOD_NOREPEAT, VK_ESCAPE.0 as u32);
     }
 
@@ -745,7 +751,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_KEYDOWN => {
             let vk = wparam.0 as u16;
             // F1: toggle pin mode (only when overlay has focus, i.e. not in pin focus)
-            if vk == 0x70 {
+            if vk == VK_F1.0 {
                 APP.with(|app| {
                     if let Some(ref mut state) = *app.borrow_mut() {
                         exit_pin_focus(state);
@@ -951,6 +957,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let h = ((lparam.0 >> 16) & 0xFFFF) as u16 as u32;
             APP.with(|app| {
                 if let Some(ref mut state) = *app.borrow_mut() {
+                    // Resize invalidates thumbnail positions -- exit pin focus
+                    exit_pin_focus(state);
                     state.canvas.canvas_w = w as f64;
                     state.canvas.canvas_h = h as f64;
                     if let Some(ref mut render) = state.render {
@@ -993,6 +1001,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let state = app.borrow();
                 if let Some(ref state) = *state {
                     if let Some(ref focus) = state.pin_focus {
+                        if focus.grid_idx >= state.canvas.layout.len() {
+                            return false;
+                        }
                         let x = (lparam.0 & 0xFFFF) as i16 as i32;
                         let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
                         let tr = state.canvas.thumb_rect(focus.grid_idx);

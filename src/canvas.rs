@@ -205,26 +205,6 @@ impl CanvasState {
         if count > 0 { Some(count - 1) } else { None }
     }
 
-    /// Translate screen-space click to target window client-area coordinates.
-    pub fn screen_to_client_coords(
-        &self,
-        grid_idx: usize,
-        sx: i32,
-        sy: i32,
-        client_w: i32,
-        client_h: i32,
-    ) -> Option<(i32, i32)> {
-        let tr = self.thumb_rect(grid_idx);
-        let tw = (tr.right - tr.left) as f64;
-        let th = (tr.bottom - tr.top) as f64;
-        if tw <= 0.0 || th <= 0.0 {
-            return None;
-        }
-        let norm_x = ((sx - tr.left) as f64 / tw).clamp(0.0, 1.0);
-        let norm_y = ((sy - tr.top) as f64 / th).clamp(0.0, 1.0);
-        Some(((norm_x * client_w as f64) as i32, (norm_y * client_h as f64) as i32))
-    }
-
     /// Screen-space rect for the PIN toggle button (top-right of search bar).
     pub fn pin_button_rect(&self) -> RECT {
         let w = 60.0;
