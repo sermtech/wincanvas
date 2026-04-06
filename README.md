@@ -2,7 +2,7 @@
 
 Infinite canvas window manager for Windows. Shows live DWM thumbnails of all open windows on a pannable, zoomable canvas -- including windows on other virtual desktops.
 
-<video src="assets/demo.mp4" autoplay loop muted playsinline></video>
+<video src="https://github.com/sermtech/wincanvas/releases/download/v0.1.0/demo.mp4" autoplay loop muted playsinline></video>
 
 WinCanvas is a lightweight **window switcher and virtual desktop manager** for Windows 10/11 that gives you a live bird's-eye view of every open window -- across all virtual desktops -- on a single zoomable canvas. Think of it as an Expose/Mission Control experience for Windows: hit Ctrl+Space from any app, see everything at once, click to jump. Unlike traditional alt-tab replacements or taskbar tools (PowerToys, AltSnap, TaskSwitchXP), WinCanvas renders real-time DWM thumbnails on an infinite canvas you can pan and zoom freely, with instant search and cross-desktop navigation -- no window moves, no layout presets, no configuration.
 
