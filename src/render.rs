@@ -33,6 +33,8 @@ pub struct RenderContext {
     pub badge_brush: ID2D1SolidColorBrush,
     pub badge_text_brush: ID2D1SolidColorBrush,
     pub pin_brush: ID2D1SolidColorBrush,
+    pub cloaked_bg_brush: ID2D1SolidColorBrush,
+    pub cloaked_border_brush: ID2D1SolidColorBrush,
     pub badge_format: IDWriteTextFormat,
     pub dwrite_factory: IDWriteFactory,
     pub title_format: IDWriteTextFormat,
@@ -109,6 +111,14 @@ impl RenderContext {
                 .CreateSolidColorBrush(&color(1.0, 0.6, 0.0, 1.0), None)
                 .unwrap();
 
+            let cloaked_bg_brush = target
+                .CreateSolidColorBrush(&color(0.12, 0.12, 0.20, 0.85), None)
+                .unwrap();
+
+            let cloaked_border_brush = target
+                .CreateSolidColorBrush(&color(0.4, 0.45, 0.7, 0.6), None)
+                .unwrap();
+
             let dwrite_factory: IDWriteFactory =
                 DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap();
 
@@ -172,6 +182,8 @@ impl RenderContext {
                 badge_brush,
                 badge_text_brush,
                 pin_brush,
+                cloaked_bg_brush,
+                cloaked_border_brush,
                 dwrite_factory,
                 title_format,
                 search_format,
@@ -364,6 +376,47 @@ impl RenderContext {
             };
             self.target
                 .DrawRoundedRectangle(&rounded, &self.pin_brush, 3.0, None);
+        }
+    }
+
+    pub fn draw_cloaked_placeholder(&self, rect: RECT, title: &str, process_name: &str) {
+        unsafe {
+            let d2d_rect = D2D_RECT_F {
+                left: rect.left as f32,
+                top: rect.top as f32,
+                right: rect.right as f32,
+                bottom: rect.bottom as f32,
+            };
+            // Dimmed background fill
+            let rounded = D2D1_ROUNDED_RECT {
+                rect: d2d_rect,
+                radiusX: CORNER_RADIUS,
+                radiusY: CORNER_RADIUS,
+            };
+            self.target.FillRoundedRectangle(&rounded, &self.cloaked_bg_brush);
+            self.target.DrawRoundedRectangle(&rounded, &self.cloaked_border_brush, 1.5, None);
+
+            // Centered label: process name + title
+            let label = if title.len() > 40 {
+                format!("{}\n{}...", process_name, &title[..37])
+            } else {
+                format!("{}\n{}", process_name, title)
+            };
+            let text: Vec<u16> = label.encode_utf16().collect();
+            let text_rect = D2D_RECT_F {
+                left: d2d_rect.left + 8.0,
+                top: d2d_rect.top + 8.0,
+                right: d2d_rect.right - 8.0,
+                bottom: d2d_rect.bottom - 8.0,
+            };
+            self.target.DrawText(
+                &text,
+                &self.title_format,
+                &text_rect,
+                &self.text_brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE(0),
+            );
         }
     }
 
