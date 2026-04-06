@@ -470,23 +470,50 @@ fn update_pin_position(state: &mut AppState) {
     }
 }
 
+/// Get the current virtual desktop GUID by probing non-cloaked windows from our list.
+/// Shell_TrayWnd is pinned to ALL desktops so GetWindowDesktopId returns "Element not found".
+/// Instead, find a regular non-cloaked window and query its desktop GUID.
+fn get_current_desktop_id(vdm: &IVirtualDesktopManager, windows: &[WindowInfo]) -> Option<windows::core::GUID> {
+    unsafe {
+        // Try non-cloaked windows from our enumerated list
+        for w in windows {
+            if w.cloaked {
+                continue;
+            }
+            // Check IsWindowOnCurrentVirtualDesktop first as a sanity check
+            match vdm.IsWindowOnCurrentVirtualDesktop(w.hwnd) {
+                Ok(on_current) if on_current.as_bool() => {
+                    if let Ok(guid) = vdm.GetWindowDesktopId(w.hwnd) {
+                        // GUID_NULL means the window isn't assigned (pinned / special)
+                        if guid != windows::core::GUID::zeroed() {
+                            return Some(guid);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Fallback: try any non-cloaked window without the IsWindowOnCurrentVirtualDesktop check
+        for w in windows {
+            if w.cloaked {
+                continue;
+            }
+            if let Ok(guid) = vdm.GetWindowDesktopId(w.hwnd) {
+                if guid != windows::core::GUID::zeroed() {
+                    return Some(guid);
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Move the canvas to whichever virtual desktop the user is currently on.
 fn ensure_canvas_on_current_desktop(state: &AppState) {
     if let Some(ref vdm) = state.vdm {
-        unsafe {
-            if let Ok(on_current) = vdm.IsWindowOnCurrentVirtualDesktop(state.hwnd) {
-                if on_current.as_bool() { return; }
-            }
-            // Use foreground window as reference; fall back to taskbar (always on current desktop)
-            let fg = GetForegroundWindow();
-            let tray_class: Vec<u16> = "Shell_TrayWnd\0".encode_utf16().collect();
-            let probe = if !fg.0.is_null() { fg } else {
-                FindWindowW(PCWSTR(tray_class.as_ptr()), None).unwrap_or(HWND::default())
-            };
-            if !probe.0.is_null() {
-                if let Ok(desktop_id) = vdm.GetWindowDesktopId(probe) {
-                    let _ = vdm.MoveWindowToDesktop(state.hwnd, &desktop_id);
-                }
+        if let Some(desktop_id) = get_current_desktop_id(vdm, &state.windows) {
+            unsafe {
+                let _ = vdm.MoveWindowToDesktop(state.hwnd, &desktop_id);
             }
         }
     }
@@ -508,31 +535,31 @@ fn enter_pin_focus(state: &mut AppState, grid_idx: usize) {
 
     let mut is_cloaked = state.windows[win_idx].cloaked;
 
-    // For cloaked (cross-desktop) windows: move canvas to that desktop first
+    // For cloaked (cross-desktop) windows: move target to our desktop so it uncloaks
     if is_cloaked {
         if let Some(ref vdm) = state.vdm {
-            unsafe {
-                if let Ok(target_desktop) = vdm.GetWindowDesktopId(target) {
-                    let _ = vdm.MoveWindowToDesktop(state.hwnd, &target_desktop);
-                    let _ = SetForegroundWindow(target);
-                    // Reclaim top position without relying on foreground lock
-                    let _ = SetWindowPos(state.hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                    let _ = SetForegroundWindow(state.hwnd);
+            if let Some(our_desktop) = get_current_desktop_id(vdm, &state.windows) {
+                let move_ok = unsafe { vdm.MoveWindowToDesktop(target, &our_desktop) };
+                if move_ok.is_ok() {
+                    state.windows[win_idx].cloaked = false;
+                    is_cloaked = false;
+                    // Unregister old thumbnail before re-registering
+                    if let Some(thumb) = state.windows[win_idx].thumbnail {
+                        unregister_thumbnail(thumb);
+                        state.windows[win_idx].thumbnail = None;
+                    }
+                    // Re-measure now that window is on our desktop
+                    let prev_sw = state.windows[win_idx].source_w;
+                    let prev_sh = state.windows[win_idx].source_h;
+                    let prev_cw = state.windows[win_idx].client_w;
+                    let prev_ch = state.windows[win_idx].client_h;
+                    register_and_measure_thumbnail(state.hwnd, &mut state.windows[win_idx]);
+                    if state.windows[win_idx].source_w <= 0 { state.windows[win_idx].source_w = prev_sw; }
+                    if state.windows[win_idx].source_h <= 0 { state.windows[win_idx].source_h = prev_sh; }
+                    if state.windows[win_idx].client_w <= 0 { state.windows[win_idx].client_w = prev_cw; }
+                    if state.windows[win_idx].client_h <= 0 { state.windows[win_idx].client_h = prev_ch; }
                 }
             }
-            state.windows[win_idx].cloaked = false;
-            is_cloaked = false;
-            // Re-measure; keep existing dimensions if DWM returns zeros (async uncloaking)
-            let prev_sw = state.windows[win_idx].source_w;
-            let prev_sh = state.windows[win_idx].source_h;
-            let prev_cw = state.windows[win_idx].client_w;
-            let prev_ch = state.windows[win_idx].client_h;
-            register_and_measure_thumbnail(state.hwnd, &mut state.windows[win_idx]);
-            if state.windows[win_idx].source_w <= 0 { state.windows[win_idx].source_w = prev_sw; }
-            if state.windows[win_idx].source_h <= 0 { state.windows[win_idx].source_h = prev_sh; }
-            if state.windows[win_idx].client_w <= 0 { state.windows[win_idx].client_w = prev_cw; }
-            if state.windows[win_idx].client_h <= 0 { state.windows[win_idx].client_h = prev_ch; }
         }
     }
 
@@ -872,6 +899,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         } else {
                             let win_idx = state.filtered_indices[grid_idx];
                             let target_hwnd = state.windows[win_idx].hwnd;
+                            let is_cloaked = state.windows[win_idx].cloaked;
+                            if is_cloaked {
+                                if let Some(ref vdm) = state.vdm {
+                                    if let Some(our_desktop) = get_current_desktop_id(vdm, &state.windows) {
+                                        let _ = unsafe { vdm.MoveWindowToDesktop(target_hwnd, &our_desktop) };
+                                    }
+                                }
+                            }
                             let _ = ShowWindow(hwnd, SW_HIDE);
                             state.visible = false;
                             let _ = SetForegroundWindow(target_hwnd);
@@ -996,6 +1031,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 if sel < state.filtered_indices.len() {
                                     let win_idx = state.filtered_indices[sel];
                                     let target_hwnd = state.windows[win_idx].hwnd;
+                                    if state.windows[win_idx].cloaked {
+                                        if let Some(ref vdm) = state.vdm {
+                                            if let Some(our_desktop) = get_current_desktop_id(vdm, &state.windows) {
+                                                let _ = unsafe { vdm.MoveWindowToDesktop(target_hwnd, &our_desktop) };
+                                            }
+                                        }
+                                    }
                                     let _ = ShowWindow(hwnd, SW_HIDE);
                                     state.visible = false;
                                     let _ = SetForegroundWindow(target_hwnd);
@@ -1049,6 +1091,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             if idx < state.filtered_indices.len() {
                                 let win_idx = state.filtered_indices[idx];
                                 let target_hwnd = state.windows[win_idx].hwnd;
+                                if state.windows[win_idx].cloaked {
+                                    if let Some(ref vdm) = state.vdm {
+                                        if let Some(our_desktop) = get_current_desktop_id(vdm, &state.windows) {
+                                            let _ = unsafe { vdm.MoveWindowToDesktop(target_hwnd, &our_desktop) };
+                                        }
+                                    }
+                                }
                                 let _ = ShowWindow(hwnd, SW_HIDE);
                                 state.visible = false;
                                 let _ = SetForegroundWindow(target_hwnd);
