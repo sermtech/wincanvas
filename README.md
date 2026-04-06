@@ -2,6 +2,10 @@
 
 Infinite canvas window manager for Windows. Shows live DWM thumbnails of all open windows on a pannable, zoomable canvas -- including windows on other virtual desktops.
 
+![demo](assets/demo.gif)
+
+![screenshot](assets/screenshot.png)
+
 ## Requirements
 
 - Windows 10 / 11 with DWM enabled (default)
